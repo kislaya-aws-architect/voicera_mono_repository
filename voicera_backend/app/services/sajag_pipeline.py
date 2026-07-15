@@ -1,0 +1,118 @@
+"""
+Sajag processing pipeline: transcription + hazard classification for a single
+inbound report. Deliberately calls ai4bharat_stt_server and llm_server directly
+over HTTP rather than going through the Pipecat pipeline in voice_2_voice_server —
+that pipeline is built for live streaming telephony audio (WebSocket frames), not
+a single discrete voice note arriving via webhook. See README_sajag_glific.md for
+why this is a separate call path.
+"""
+import logging
+from typing import List, Optional
+
+import httpx
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+async def transcribe_voice_note(audio_b64: str, language_id: str = "hi") -> Optional[str]:
+    """
+    Call ai4bharat_stt_server's POST /transcribe.
+
+    Verified against the actual server code (ai4bharat_stt_server/server.py):
+    request body is {"audio_b64": ..., "language_id": ...}, response is {"text": ...}.
+    """
+    url = f"{settings.SAJAG_STT_SERVER_URL.rstrip('/')}/transcribe"
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, json={"audio_b64": audio_b64, "language_id": language_id})
+            resp.raise_for_status()
+            return resp.json().get("text")
+    except httpx.HTTPError as e:
+        logger.error(f"STT call to {url} failed: {e}")
+        return None
+
+
+async def classify_report(text: str) -> Optional[List[str]]:
+    """
+    Call llm_server's OpenAI-compatible /v1/chat/completions endpoint to tag a
+    report against a hazard taxonomy.
+
+    PROVISIONAL: the hazard taxonomy itself isn't defined anywhere in the concept
+    note or the 9 Jul architecture note beyond the three triangulation tiers
+    (Confirmed/Emerging/Contextual, which are a separate, unscored field — see
+    sajag_report_service.py). The tag list below is a starting placeholder, not a
+    confirmed taxonomy — needs sign-off before this is treated as real classification
+    output rather than a rough first pass.
+    """
+    if not text:
+        return None
+
+    placeholder_taxonomy = [
+        "missing_signage", "no_footpath", "unmarked_crossing", "poor_lighting",
+        "blind_merge", "speeding_reported", "median_gap", "other",
+    ]
+
+    url = f"{settings.SAJAG_LLM_SERVER_URL.rstrip('/')}/v1/chat/completions"
+    system_prompt = (
+        "You are classifying a road-safety hazard report from a citizen WhatsApp "
+        "message for SaveLIFE Foundation. Given the report text, return the single "
+        f"best-fitting tag from this list, and nothing else: {placeholder_taxonomy}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                url,
+                json={
+                    "model": settings.SAJAG_LLM_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": text},
+                    ],
+                    "max_tokens": 20,
+                    "temperature": 0,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            tag = data["choices"][0]["message"]["content"].strip()
+            return [tag] if tag in placeholder_taxonomy else ["other"]
+    except (httpx.HTTPError, KeyError, IndexError) as e:
+        logger.error(f"LLM classification call to {url} failed: {e}")
+        return None
+
+
+def redact_message_text(text: str) -> str:
+    """
+    NOT IMPLEMENTED. Per open item "d" in the 9 Jul architecture note, redacting
+    PII that might appear inside free-text message content (names, other people's
+    phone numbers, etc. — separate from the reporter's own phone number, which is
+    hashed in sajag_hashing.py) needs a scoping decision before it can be built or
+    estimated. This function currently returns the text unchanged and logs a
+    warning so it can never be silently mistaken for working redaction.
+
+    DO NOT wire this report pipeline into anything citizen-facing or
+    government-facing until this is actually implemented — see Section 8 of the
+    concept note (Data Protection, Ethics & Safeguarding): "no reporter can be
+    exposed to retaliation or identified in any government-facing output."
+    """
+    logger.warning(
+        "redact_message_text() is a stub — message text is being stored/forwarded "
+        "WITHOUT PII redaction. Do not use for real reports until this is built."
+    )
+    return text
+
+
+def redact_media(photo_url: Optional[str]) -> Optional[str]:
+    """
+    NOT IMPLEMENTED. Per open item "e" in the 9 Jul architecture note, automated
+    face/number-plate redaction in photos has no existing foundation in VoicERA and
+    needs its own technical evaluation. This function is a pass-through stub only.
+    """
+    if photo_url:
+        logger.warning(
+            "redact_media() is a stub — photo is being stored/forwarded WITHOUT "
+            "face/number-plate redaction."
+        )
+    return photo_url

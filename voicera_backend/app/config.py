@@ -54,7 +54,25 @@ class Settings:
         or "http://localhost:7860"
     )
     BATCH_SCHEDULER_POLL_SECONDS: int = int(os.getenv("BATCH_SCHEDULER_POLL_SECONDS", "5"))
-    
+
+    # --- Sajag / Glific webhook (SaveLIFE Foundation WhatsApp integration) ---
+    # PROVISIONAL: single shared-secret model for the POC (one partner org, SLF).
+    # If VoicERA ever needs to support more than one Glific-backed partner, this should
+    # move to the existing Integrations collection pattern used for Vobiz
+    # (see app/services/integration_service.py + app/services/vobiz.py) instead of a
+    # single global env var.
+    SAJAG_GLIFIC_WEBHOOK_SECRET: str = os.getenv("SAJAG_GLIFIC_WEBHOOK_SECRET", "")
+
+    # ai4bharat_stt_server exposes a plain REST POST /transcribe (audio_b64, language_id).
+    # Point this at the STT server used for the Sajag pipeline (same instance already
+    # running for the telephony flow is fine).
+    SAJAG_STT_SERVER_URL: str = os.getenv("SAJAG_STT_SERVER_URL", "http://localhost:8001")
+
+    # llm_server runs a vLLM OpenAI-compatible server (Qwen3-8B by default).
+    # Used for hazard classification / tagging of the transcribed report text.
+    SAJAG_LLM_SERVER_URL: str = os.getenv("SAJAG_LLM_SERVER_URL", "http://localhost:8003")
+    SAJAG_LLM_MODEL: str = os.getenv("SAJAG_LLM_MODEL", "Qwen/Qwen3-8B")
+
     @property
     def mongodb_uri(self) -> str:
         """Build MongoDB connection URI."""

@@ -521,3 +521,67 @@ class BatchScheduleRequest(BaseModel):
     timezone: str
     agent_type: Optional[str] = None
     concurrency: Optional[int] = Field(default=None, ge=1, le=20)
+
+
+# --- Sajag / Glific webhook (SaveLIFE Foundation WhatsApp integration) ---
+#
+# PROVISIONAL: field names below reflect what's validated so far (per the
+# 9 Jul architecture note and the concept note's "Capture & data model" section),
+# NOT a confirmed Glific payload contract. Glific's own source stores lat/long on
+# the contact record when a citizen shares location — how exactly that reaches this
+# webhook (inline in the same payload vs. a separate call) is still unconfirmed
+# (open item "i" from the 9 Jul note). Update this model, not the router logic,
+# once that's confirmed.
+
+class GlificLocation(BaseModel):
+    """Location as captured natively by Glific when a citizen shares it on WhatsApp."""
+    latitude: float
+    longitude: float
+    accuracy_meters: Optional[float] = None
+
+
+class GlificWebhookPayload(BaseModel):
+    """
+    Inbound payload from Glific for a single Sajag hazard report.
+
+    PROVISIONAL SHAPE — swap this out once the Glific team confirms their actual
+    webhook contract (expected later this week per the 14 Jul call). In particular:
+    contact_phone may not be raw E.164, and voice_note_url / photo_url may arrive as
+    Glific media IDs rather than direct URLs.
+    """
+    glific_contact_id: str
+    contact_phone: str  # raw, hashed server-side before storage — never stored as-is
+    channel: str = "whatsapp"
+    language_id: Optional[str] = "hi"  # AI4Bharat needs this explicit; Glific doesn't auto-detect either
+    message_text: Optional[str] = None
+    voice_note_url: Optional[str] = None
+    photo_url: Optional[str] = None
+    location: Optional[GlificLocation] = None
+    consent_given: bool = False
+    received_at: Optional[str] = None  # ISO timestamp from Glific; server sets one if absent
+
+
+class SajagReportResponse(BaseModel):
+    """A stored Sajag report, as returned to internal/dashboard consumers."""
+    report_id: str
+    glific_contact_id: str
+    contact_phone_hash: str
+    channel: str
+    language_id: Optional[str] = None
+    transcription: Optional[str] = None
+    hazard_tags: Optional[List[str]] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    location_accuracy_meters: Optional[float] = None
+    photo_url: Optional[str] = None
+    triangulation_tier: Optional[str] = None  # Confirmed | Emerging | Contextual — NOT computed yet, see status
+    status: str  # Received -> Triaged -> Validated -> Escalated -> In-Progress -> Resolved -> Feedback-Sent
+    received_at: str
+    created_at: str
+    updated_at: str
+
+
+class SajagReportStatusUpdate(BaseModel):
+    """Internal status-update payload (e.g. from the admin dashboard)."""
+    status: str
+    note: Optional[str] = None
