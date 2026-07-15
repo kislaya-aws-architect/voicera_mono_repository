@@ -15,6 +15,7 @@ import {
   BookOpen,
   LogIn,
   Layers,
+  ShieldAlert,
 } from "lucide-react"
 
 import {
@@ -64,6 +65,11 @@ const mainNavItems = [
     title: "History",
     url: "/history",
     icon: Clock,
+  },
+  {
+    title: "Sajag Reports",
+    url: "/sajag",
+    icon: ShieldAlert,
   },
   {
     title: "Analytics",

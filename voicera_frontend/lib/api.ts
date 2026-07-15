@@ -1634,3 +1634,99 @@ export async function checkUserExists(email: string): Promise<User | null> {
     return null
   }
 }
+
+// --- Sajag / Glific (SaveLIFE Foundation WhatsApp integration) ---
+//
+// NOTE: reports only exist here once the Glific webhook (app/routers/glific.py
+// in voicera_backend) has actually received something, or once the demo seed
+// script has been run — see voicera_backend/scripts/seed_sajag_demo_data.py.
+// This dashboard reads real data; it does not fabricate anything client-side.
+
+export const SAJAG_REPORT_STATUSES = [
+  "Received",
+  "Triaged",
+  "Validated",
+  "Escalated",
+  "In-Progress",
+  "Resolved",
+  "Feedback-Sent",
+] as const
+
+export type SajagReportStatus = (typeof SAJAG_REPORT_STATUSES)[number]
+
+export interface SajagReport {
+  report_id: string
+  glific_contact_id: string
+  contact_phone_hash: string
+  channel: string
+  language_id?: string | null
+  transcription?: string | null
+  hazard_tags?: string[] | null
+  latitude?: number | null
+  longitude?: number | null
+  location_accuracy_meters?: number | null
+  photo_url?: string | null
+  triangulation_tier?: "Confirmed" | "Emerging" | "Contextual" | null
+  status: SajagReportStatus
+  received_at: string
+  created_at: string
+  updated_at: string
+}
+
+export async function getSajagReports(status?: string): Promise<SajagReport[]> {
+  const query = status ? `?status_filter=${encodeURIComponent(status)}` : ""
+  const response = await fetchApiRoute(`/api/sajag/reports${query}`)
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(
+      (error as { detail?: string }).detail ||
+        (error as { error?: string }).error ||
+        "Failed to fetch Sajag reports"
+    )
+  }
+
+  return response.json()
+}
+
+export async function getSajagReport(reportId: string): Promise<SajagReport> {
+  const response = await fetchApiRoute(
+    `/api/sajag/reports/${encodeURIComponent(reportId)}`
+  )
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(
+      (error as { detail?: string }).detail ||
+        (error as { error?: string }).error ||
+        "Failed to fetch Sajag report"
+    )
+  }
+
+  return response.json()
+}
+
+export async function updateSajagReportStatus(
+  reportId: string,
+  newStatus: SajagReportStatus,
+  note?: string
+): Promise<SajagReport> {
+  const response = await fetchApiRoute(
+    `/api/sajag/reports/${encodeURIComponent(reportId)}/status`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ status: newStatus, note }),
+    }
+  )
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(
+      (error as { detail?: string }).detail ||
+        (error as { error?: string }).error ||
+        "Failed to update Sajag report status"
+    )
+  }
+
+  return response.json()
+}
