@@ -71,6 +71,17 @@ async def verify_glific_webhook_secret(
     return True
 
 
+async def _process_text_report_async(report_id: str, message_text: str) -> None:
+    """
+    Background task: classify a text-only report (no voice note, so no STT step
+    needed). Mirrors _process_voice_note_async's classify+store tail — kept
+    separate rather than shared because the two paths differ in whether
+    transcription is already known up front.
+    """
+    hazard_tags = await sajag_pipeline.classify_report(message_text)
+    sajag_report_service.update_report_processing(report_id, hazard_tags=hazard_tags)
+
+
 async def _process_voice_note_async(report_id: str, voice_note_url: str, language_id: str) -> None:
     """
     Background task: fetch the voice note, transcribe, classify. Runs after the
@@ -156,9 +167,11 @@ async def receive_glific_report(
     )
 
     # If there's a text message but no voice note, store the (stub-redacted) text
-    # directly rather than waiting on the background task.
+    # synchronously, then classify it in the background — mirrors the voice-note
+    # path's design (classification latency shouldn't block the webhook response).
     if message_text and not payload.voice_note_url:
         sajag_report_service.update_report_processing(report["report_id"], transcription=message_text)
+        background_tasks.add_task(_process_text_report_async, report["report_id"], message_text)
 
     # Voice note transcription + classification happen after we've already
     # acknowledged Glific's call, since STT/LLM latency shouldn't block the
