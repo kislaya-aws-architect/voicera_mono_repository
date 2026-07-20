@@ -546,7 +546,7 @@ class GlificWebhookPayload(BaseModel):
 
     PROVISIONAL SHAPE — swap this out once the Glific team confirms their actual
     webhook contract (expected later this week per the 14 Jul call). In particular:
-    contact_phone may not be raw E.164, and voice_note_url / photo_url may arrive as
+    contact_phone may not be raw E.164, and voice_note_url / photos entries may arrive as
     Glific media IDs rather than direct URLs.
     """
     glific_contact_id: str
@@ -555,7 +555,7 @@ class GlificWebhookPayload(BaseModel):
     language_id: Optional[str] = "hi"  # AI4Bharat needs this explicit; Glific doesn't auto-detect either
     message_text: Optional[str] = None
     voice_note_url: Optional[str] = None
-    photo_url: Optional[str] = None
+    photos: Optional[List[str]] = None  # SLF contract (confirmed): array, not a single URL
     location: Optional[GlificLocation] = None
     consent_given: bool = False
     received_at: Optional[str] = None  # ISO timestamp from Glific; server sets one if absent
@@ -568,12 +568,13 @@ class SajagReportResponse(BaseModel):
     contact_phone_hash: str
     channel: str
     language_id: Optional[str] = None
-    transcription: Optional[str] = None
+    transcription: Optional[str] = None  # original-language text — source of record, never overwritten
+    translated_text_hi: Optional[str] = None  # Hindi translation of transcription (agreed contract with SLF)
     hazard_tags: Optional[List[str]] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     location_accuracy_meters: Optional[float] = None
-    photo_url: Optional[str] = None
+    photos: Optional[List[str]] = None  # SLF contract (confirmed): array, not a single URL
     triangulation_tier: Optional[str] = None  # Confirmed | Emerging | Contextual — NOT computed yet, see status
     status: str  # Received -> Triaged -> Validated -> Escalated -> In-Progress -> Resolved -> Feedback-Sent
     received_at: str

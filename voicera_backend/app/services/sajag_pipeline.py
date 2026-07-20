@@ -6,7 +6,9 @@ that pipeline is built for live streaming telephony audio (WebSocket frames), no
 a single discrete voice note arriving via webhook. See README_sajag_glific.md for
 why this is a separate call path.
 """
+import asyncio
 import logging
+import re
 from typing import List, Optional
 
 import httpx
@@ -14,6 +16,39 @@ import httpx
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+async def convert_to_pcm16_mono_16k(audio_bytes: bytes) -> bytes:
+    """
+    Convert arbitrary input audio (whatever format a voice note actually arrives
+    as — WAV with a header, WhatsApp-native OGG/Opus, mp3, anything) into raw
+    headerless 16kHz mono 16-bit PCM.
+
+    This exists because ai4bharat_stt_server's /transcribe does zero format
+    handling on its side — see _decode_audio_b64() in ai4bharat_stt_server/server.py,
+    which is a bare `np.frombuffer(audio_bytes, dtype=np.int16)`. Sending it a real
+    WAV file (header included) or a non-16kHz/non-mono/non-PCM file doesn't error;
+    it silently decodes to noise and the model correctly returns an empty
+    transcription. Discovered directly during local testing (2026-07-20) — the
+    Sajag pipeline had no conversion step before this, meaning any voice note that
+    wasn't already exactly 16kHz mono s16le PCM would have failed silently, with no
+    error logged anywhere, in production too.
+
+    Requires ffmpeg on PATH — added to voicera_backend/Dockerfile alongside this.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-i", "pipe:0", "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate(input=audio_bytes)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg audio conversion failed (exit {proc.returncode}): "
+            f"{stderr.decode(errors='replace')[-500:]}"
+        )
+    return stdout
 
 
 async def transcribe_voice_note(audio_b64: str, language_id: str = "hi") -> Optional[str]:
@@ -104,15 +139,66 @@ def redact_message_text(text: str) -> str:
     return text
 
 
-def redact_media(photo_url: Optional[str]) -> Optional[str]:
+def redact_media(photos: Optional[List[str]]) -> Optional[List[str]]:
     """
     NOT IMPLEMENTED. Per open item "e" in the 9 Jul architecture note, automated
     face/number-plate redaction in photos has no existing foundation in VoicERA and
     needs its own technical evaluation. This function is a pass-through stub only.
+
+    Takes/returns a list — SLF's confirmed contract is an array of photo URLs, not
+    a single photo per report.
     """
-    if photo_url:
+    if photos:
         logger.warning(
-            "redact_media() is a stub — photo is being stored/forwarded WITHOUT "
-            "face/number-plate redaction."
+            "redact_media() is a stub — %d photo(s) are being stored/forwarded "
+            "WITHOUT face/number-plate redaction.",
+            len(photos),
         )
-    return photo_url
+    return photos
+
+
+_DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+
+
+async def translate_to_hindi(text: str, source_language_id: str = "hi") -> Optional[str]:
+    """
+    Translate report text (already-transcribed voice note, or raw WhatsApp text)
+    into Hindi — per the contract agreed with SLF: whatever language the input
+    arrives in, the stored/forwarded text should be Hindi.
+
+    NEW — there was no translation step in this pipeline before; transcribe_voice_note()
+    only transcribes in the language it's told the audio is in, it does not translate.
+
+    Calls a dedicated IndicTrans2 translation service (SAJAG_TRANSLATION_SERVER_URL),
+    not the general-purpose LLM server classify_report() uses. Switched from an
+    earlier LLM-chat-prompt approach after testing (2026-07-20) showed general chat
+    models (Qwen2.5 3B and 7B via Ollama) produced fluent-looking but inaccurate
+    Hindi — wrong words, invented non-words, one script-mixing glitch. IndicTrans2
+    is purpose-built for translation and verified accurate on the same test sentence.
+    """
+    if not text:
+        return None
+
+    # Check the ACTUAL text content for Devanagari script, not the language_id
+    # metadata field. Found directly during testing (2026-07-20): language_id
+    # reflects the reporter's declared/preferred language — mainly used as the STT
+    # hint for voice notes — not a live signal of what script typed free-text is
+    # actually in. A report with language_id="hi" but English message_text (citizens
+    # code-switch on WhatsApp constantly) was previously skipping translation
+    # entirely and silently storing the English text into translated_text_hi,
+    # mislabeled as if it were the Hindi translation. Checking the text itself is
+    # the only way to know for certain.
+    if _DEVANAGARI_RE.search(text):
+        return text
+
+    url = f"{settings.SAJAG_TRANSLATION_SERVER_URL.rstrip('/')}/translate"
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                url, json={"text": text, "src_lang": "eng_Latn", "tgt_lang": "hin_Deva"}
+            )
+            resp.raise_for_status()
+            return resp.json().get("text")
+    except (httpx.HTTPError, KeyError) as e:
+        logger.error(f"Hindi translation call to {url} failed: {e}")
+        return None

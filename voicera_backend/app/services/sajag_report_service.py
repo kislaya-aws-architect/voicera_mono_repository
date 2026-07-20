@@ -35,7 +35,7 @@ def create_report(
     channel: str,
     language_id: Optional[str],
     location: Optional[Dict[str, Any]],
-    photo_url: Optional[str],
+    photos: Optional[List[str]],
     received_at: Optional[str],
 ) -> Dict[str, Any]:
     """Create a new Sajag report in status 'Received'. Transcription/classification
@@ -55,11 +55,12 @@ def create_report(
         "channel": channel,
         "language_id": language_id,
         "transcription": None,
+        "translated_text_hi": None,
         "hazard_tags": None,
         "latitude": location.get("latitude") if location else None,
         "longitude": location.get("longitude") if location else None,
         "location_accuracy_meters": location.get("accuracy_meters") if location else None,
-        "photo_url": photo_url,
+        "photos": photos or [],
         # Triangulation tier (Confirmed / Emerging / Contextual) is NOT computed here.
         # Per open item "h" in the 9 Jul note, whether that scoring happens on
         # VoicERA's side or SLF's is still unconfirmed. Left null until that's decided.
@@ -78,15 +79,19 @@ def create_report(
 def update_report_processing(
     report_id: str,
     transcription: Optional[str] = None,
+    translated_text_hi: Optional[str] = None,
     hazard_tags: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Attach STT transcription / LLM classification results to an existing report."""
+    """Attach STT transcription / Hindi translation / LLM classification results to
+    an existing report."""
     db = get_database()
     collection = db[COLLECTION_NAME]
 
     update_fields: Dict[str, Any] = {"updated_at": datetime.utcnow().isoformat()}
     if transcription is not None:
         update_fields["transcription"] = transcription
+    if translated_text_hi is not None:
+        update_fields["translated_text_hi"] = translated_text_hi
     if hazard_tags is not None:
         update_fields["hazard_tags"] = hazard_tags
 

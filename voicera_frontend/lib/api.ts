@@ -1661,11 +1661,12 @@ export interface SajagReport {
   channel: string
   language_id?: string | null
   transcription?: string | null
+  translated_text_hi?: string | null
   hazard_tags?: string[] | null
   latitude?: number | null
   longitude?: number | null
   location_accuracy_meters?: number | null
-  photo_url?: string | null
+  photos?: string[] | null
   triangulation_tier?: "Confirmed" | "Emerging" | "Contextual" | null
   status: SajagReportStatus
   received_at: string

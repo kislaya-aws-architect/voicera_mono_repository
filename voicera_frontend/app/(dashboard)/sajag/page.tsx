@@ -330,19 +330,35 @@ export default function SajagReportsPage() {
                   </div>
                 )}
 
-                {selectedReport.photo_url && (
+                {selectedReport.photos && selectedReport.photos.length > 0 && (
                   <div>
-                    <p className="font-medium text-muted-foreground mb-1">Photo</p>
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={selectedReport.photo_url}
-                      alt="Reported hazard"
-                      className="rounded-md border max-h-64 object-cover"
-                    />
+                    <p className="font-medium text-muted-foreground mb-1">
+                      Photos ({selectedReport.photos.length})
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      {selectedReport.photos.map((url, idx) => (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          key={idx}
+                          src={url}
+                          alt={`Reported hazard ${idx + 1}`}
+                          className="rounded-md border max-h-64 object-cover"
+                        />
+                      ))}
+                    </div>
                     <p className="text-xs text-amber-700 mt-1">
                       Not yet redacted — face/number-plate redaction is unbuilt (see
-                      status doc). Do not share this image externally as-is.
+                      status doc). Do not share these images externally as-is.
                     </p>
+                  </div>
+                )}
+
+                {selectedReport.translated_text_hi && (
+                  <div>
+                    <p className="font-medium text-muted-foreground mb-1">
+                      Hindi translation
+                    </p>
+                    <p>{selectedReport.translated_text_hi}</p>
                   </div>
                 )}
 

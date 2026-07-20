@@ -123,13 +123,14 @@ def seed(wipe: bool = False) -> None:
             channel="whatsapp",
             language_id="hi",
             location={"latitude": scenario["lat"], "longitude": scenario["lng"], "accuracy_meters": 15.0},
-            photo_url=None,
+            photos=None,
             received_at=received_at,
         )
 
         sajag_report_service.update_report_processing(
             report["report_id"],
             transcription=scenario["text"],
+            translated_text_hi=scenario["text"],  # demo data is already Hindi-language_id; no real translation call
             hazard_tags=scenario["tags"],
         )
 

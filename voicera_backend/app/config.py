@@ -68,8 +68,17 @@ class Settings:
     # running for the telephony flow is fine).
     SAJAG_STT_SERVER_URL: str = os.getenv("SAJAG_STT_SERVER_URL", "http://localhost:8001")
 
+    # Dedicated English->Hindi NMT service (IndicTrans2), separate from the LLM
+    # server used for hazard classification — different model, different contract.
+    # Added 2026-07-20 after general-purpose chat LLMs (Qwen2.5 3B/7B via Ollama)
+    # produced fluent but factually wrong Hindi; IndicTrans2 is purpose-built for
+    # translation and verified accurate on the same test sentence.
+    SAJAG_TRANSLATION_SERVER_URL: str = os.getenv("SAJAG_TRANSLATION_SERVER_URL", "http://localhost:8004")
+
     # llm_server runs a vLLM OpenAI-compatible server (Qwen3-8B by default).
-    # Used for hazard classification / tagging of the transcribed report text.
+    # Used for hazard classification / tagging AND Hindi translation of the
+    # transcribed report text (see sajag_pipeline.translate_to_hindi) — same
+    # endpoint, two different prompts. If this is down, both steps no-op/log.
     SAJAG_LLM_SERVER_URL: str = os.getenv("SAJAG_LLM_SERVER_URL", "http://localhost:8003")
     SAJAG_LLM_MODEL: str = os.getenv("SAJAG_LLM_MODEL", "Qwen/Qwen3-8B")
 

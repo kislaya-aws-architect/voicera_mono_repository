@@ -71,22 +71,35 @@ async def verify_glific_webhook_secret(
     return True
 
 
-async def _process_text_report_async(report_id: str, message_text: str) -> None:
+async def _process_text_report_async(report_id: str, message_text: str, language_id: str) -> None:
     """
-    Background task: classify a text-only report (no voice note, so no STT step
-    needed). Mirrors _process_voice_note_async's classify+store tail — kept
-    separate rather than shared because the two paths differ in whether
+    Background task: translate + classify a text-only report (no voice note, so no
+    STT step needed). Mirrors _process_voice_note_async's translate+classify+store
+    tail — kept separate rather than shared because the two paths differ in whether
     transcription is already known up front.
     """
+    translated_text_hi = await sajag_pipeline.translate_to_hindi(message_text, language_id)
     hazard_tags = await sajag_pipeline.classify_report(message_text)
-    sajag_report_service.update_report_processing(report_id, hazard_tags=hazard_tags)
+    sajag_report_service.update_report_processing(
+        report_id, hazard_tags=hazard_tags, translated_text_hi=translated_text_hi
+    )
 
 
-async def _process_voice_note_async(report_id: str, voice_note_url: str, language_id: str) -> None:
+async def _process_voice_note_async(
+    report_id: str, voice_note_url: str, language_id: str, existing_message_text: Optional[str] = None
+) -> None:
     """
     Background task: fetch the voice note, transcribe, classify. Runs after the
     webhook has already returned 202 to Glific, so STT/LLM latency never makes
     Glific's request time out.
+
+    existing_message_text: if the citizen also sent typed text alongside the voice
+    note, it was already stored synchronously as `transcription` before this task
+    started (see receive_glific_report). Passed in here so this task COMBINES the
+    voice transcription with it instead of overwriting it — previously, whichever
+    of the text-sync-write or this task ran last would silently clobber the other's
+    contribution to `transcription`. Fixed per SLF: neither citizen input should be
+    dropped when both text and voice arrive on the same report.
 
     PROVISIONAL, best-effort: this assumes voice_note_url is a directly fetchable
     URL. Per open item "i" in the 9 Jul note, we don't actually know that yet —
@@ -100,7 +113,7 @@ async def _process_voice_note_async(report_id: str, voice_note_url: str, languag
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(voice_note_url)
             resp.raise_for_status()
-            voice_note_b64 = base64.b64encode(resp.content).decode("utf-8")
+            raw_audio_bytes = resp.content
     except httpx.HTTPError as e:
         logger.error(
             "Could not fetch voice note for report %s from %s (%s) — this is "
@@ -109,6 +122,20 @@ async def _process_voice_note_async(report_id: str, voice_note_url: str, languag
         )
         return
 
+    try:
+        pcm_bytes = await sajag_pipeline.convert_to_pcm16_mono_16k(raw_audio_bytes)
+    except RuntimeError as e:
+        # Discovered during local testing: the STT server expects raw 16kHz mono
+        # PCM with zero format detection on its side. Without this conversion step,
+        # any voice note not already in that exact shape silently transcribes to
+        # empty string rather than erroring — so a conversion failure here is the
+        # more honest failure mode, logged loudly rather than producing a
+        # confusing empty transcription downstream.
+        logger.error("Audio conversion failed for report %s: %s", report_id, e)
+        return
+
+    voice_note_b64 = base64.b64encode(pcm_bytes).decode("utf-8")
+
     transcription = await sajag_pipeline.transcribe_voice_note(voice_note_b64, language_id)
     if transcription:
         # PII redaction runs here, before anything derived from the transcript is
@@ -116,11 +143,26 @@ async def _process_voice_note_async(report_id: str, voice_note_url: str, languag
         # sajag_pipeline.redact_message_text(): it is NOT yet implemented.
         transcription = sajag_pipeline.redact_message_text(transcription)
 
-    hazard_tags = await sajag_pipeline.classify_report(transcription) if transcription else None
+    # Combine rather than overwrite: if the citizen also sent typed text, keep both,
+    # clearly labeled, instead of the voice transcription silently replacing it.
+    if transcription and existing_message_text:
+        combined_transcription = f"{existing_message_text}\n\n[Voice note transcription]\n{transcription}"
+    else:
+        combined_transcription = transcription or existing_message_text
+
+    # transcription stays in the original language (source of record, per the
+    # concept note's data model). translated_text_hi is the SLF-facing Hindi
+    # version — per the agreed contract, always Hindi regardless of input language.
+    translated_text_hi = (
+        await sajag_pipeline.translate_to_hindi(combined_transcription, language_id)
+        if combined_transcription else None
+    )
+    hazard_tags = await sajag_pipeline.classify_report(combined_transcription) if combined_transcription else None
 
     sajag_report_service.update_report_processing(
         report_id=report_id,
-        transcription=transcription,
+        transcription=combined_transcription,
+        translated_text_hi=translated_text_hi,
         hazard_tags=hazard_tags,
     )
 
@@ -152,7 +194,7 @@ async def receive_glific_report(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
     message_text = sajag_pipeline.redact_message_text(payload.message_text) if payload.message_text else None
-    photo_url = sajag_pipeline.redact_media(payload.photo_url)
+    photos = sajag_pipeline.redact_media(payload.photos)
 
     location_dict = payload.location.dict() if payload.location else None
 
@@ -162,16 +204,26 @@ async def receive_glific_report(
         channel=payload.channel,
         language_id=payload.language_id,
         location=location_dict,
-        photo_url=photo_url,
+        photos=photos,
         received_at=payload.received_at,
     )
 
-    # If there's a text message but no voice note, store the (stub-redacted) text
-    # synchronously, then classify it in the background — mirrors the voice-note
-    # path's design (classification latency shouldn't block the webhook response).
-    if message_text and not payload.voice_note_url:
+    # Always store typed text synchronously the moment it arrives — previously this
+    # only happened when there was no voice note, so a citizen sending both text and
+    # a voice note had their typed text silently dropped. Fixed per SLF: neither
+    # input should be lost. (See _process_voice_note_async for how the two are
+    # combined once/if the voice note finishes transcribing.)
+    if message_text:
         sajag_report_service.update_report_processing(report["report_id"], transcription=message_text)
-        background_tasks.add_task(_process_text_report_async, report["report_id"], message_text)
+
+    # Text-only background task (translate + classify) only runs when there's no
+    # voice note — when both are present, _process_voice_note_async below handles
+    # translation/classification on the COMBINED text instead, so the two tasks
+    # don't race to overwrite each other's output.
+    if message_text and not payload.voice_note_url:
+        background_tasks.add_task(
+            _process_text_report_async, report["report_id"], message_text, payload.language_id or "hi"
+        )
 
     # Voice note transcription + classification happen after we've already
     # acknowledged Glific's call, since STT/LLM latency shouldn't block the
@@ -183,6 +235,7 @@ async def receive_glific_report(
             report["report_id"],
             payload.voice_note_url,
             payload.language_id or "hi",
+            message_text,
         )
 
     return {"status": "received", "report_id": report["report_id"]}

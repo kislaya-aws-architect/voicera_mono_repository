@@ -1,0 +1,1699 @@
+From 61ba1954da464765e9f70cae8b04c23e03350d2b Mon Sep 17 00:00:00 2001
+From: Kislaya Srivastava <kislaya@coss.org.in>
+Date: Wed, 15 Jul 2026 10:28:48 +0000
+Subject: [PATCH 1/2] Sajag/Glific webhook scaffold for SLF WhatsApp
+ integration
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implements the confirmed portions of the 9 Jul architecture note:
+- POST /api/v1/sajag/glific/webhook — new REST surface (not the Pipecat
+  telephony pipeline) receiving Glific-forwarded WhatsApp reports
+- Keyed HMAC phone-number hashing (app/services/sajag_hashing.py) —
+  replaces the unkeyed SHA-256 pattern in knowledge_service.py, which is
+  reversible for low-entropy input like phone numbers
+- SajagReports Mongo collection + status workflow
+  (Received -> Triaged -> Validated -> Escalated -> In-Progress ->
+  Resolved -> Feedback-Sent)
+- STT call-out to ai4bharat_stt_server, LLM classification call-out to
+  llm_server (vLLM), both outside the Pipecat streaming pipeline since
+  Glific sends discrete events, not a live audio stream
+- GET/PATCH dashboard endpoints for report list/detail/status update
+
+Explicitly NOT implemented (stubs only, loudly logged):
+- message-text PII redaction (open item d, 9 Jul note)
+- photo face/number-plate redaction (open item e, 9 Jul note)
+
+Explicitly PROVISIONAL pending Glific team confirmation:
+- exact webhook payload shape (open item i)
+- signature/auth scheme (shared-secret header used as placeholder)
+- status-update-to-citizen mechanism (open item f)
+- triangulation-tier scoring location (open item h)
+
+Verified: syntax-checked, imports cleanly, and exercised end-to-end
+against an in-memory mongomock DB (auth, consent gate, hashing,
+storage, list/get/patch, invalid-status handling) — see PR description
+for the test transcript. Not yet tested against a real Glific payload
+or a live STT/LLM instance.
+---
+ voicera_backend/app/config.py                 |  20 +-
+ voicera_backend/app/main.py                   |   3 +-
+ voicera_backend/app/models/schemas.py         |  64 +++++
+ voicera_backend/app/routers/glific.py         | 221 ++++++++++++++++++
+ voicera_backend/app/services/sajag_hashing.py |  64 +++++
+ .../app/services/sajag_pipeline.py            | 118 ++++++++++
+ .../app/services/sajag_report_service.py      | 122 ++++++++++
+ voicera_backend/env.example                   |  13 ++
+ 8 files changed, 623 insertions(+), 2 deletions(-)
+ create mode 100644 voicera_backend/app/routers/glific.py
+ create mode 100644 voicera_backend/app/services/sajag_hashing.py
+ create mode 100644 voicera_backend/app/services/sajag_pipeline.py
+ create mode 100644 voicera_backend/app/services/sajag_report_service.py
+
+diff --git a/voicera_backend/app/config.py b/voicera_backend/app/config.py
+index e006129..3fd677e 100644
+--- a/voicera_backend/app/config.py
++++ b/voicera_backend/app/config.py
+@@ -54,7 +54,25 @@ class Settings:
+         or "http://localhost:7860"
+     )
+     BATCH_SCHEDULER_POLL_SECONDS: int = int(os.getenv("BATCH_SCHEDULER_POLL_SECONDS", "5"))
+-    
++
++    # --- Sajag / Glific webhook (SaveLIFE Foundation WhatsApp integration) ---
++    # PROVISIONAL: single shared-secret model for the POC (one partner org, SLF).
++    # If VoicERA ever needs to support more than one Glific-backed partner, this should
++    # move to the existing Integrations collection pattern used for Vobiz
++    # (see app/services/integration_service.py + app/services/vobiz.py) instead of a
++    # single global env var.
++    SAJAG_GLIFIC_WEBHOOK_SECRET: str = os.getenv("SAJAG_GLIFIC_WEBHOOK_SECRET", "")
++
++    # ai4bharat_stt_server exposes a plain REST POST /transcribe (audio_b64, language_id).
++    # Point this at the STT server used for the Sajag pipeline (same instance already
++    # running for the telephony flow is fine).
++    SAJAG_STT_SERVER_URL: str = os.getenv("SAJAG_STT_SERVER_URL", "http://localhost:8001")
++
++    # llm_server runs a vLLM OpenAI-compatible server (Qwen3-8B by default).
++    # Used for hazard classification / tagging of the transcribed report text.
++    SAJAG_LLM_SERVER_URL: str = os.getenv("SAJAG_LLM_SERVER_URL", "http://localhost:8003")
++    SAJAG_LLM_MODEL: str = os.getenv("SAJAG_LLM_MODEL", "Qwen/Qwen3-8B")
++
+     @property
+     def mongodb_uri(self) -> str:
+         """Build MongoDB connection URI."""
+diff --git a/voicera_backend/app/main.py b/voicera_backend/app/main.py
+index d7a5cdc..b180c78 100644
+--- a/voicera_backend/app/main.py
++++ b/voicera_backend/app/main.py
+@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from app.config import settings
+ from app.database import connect_to_mongo, close_mongo_connection
+ from app.services.batch_scheduler import start_batch_scheduler, stop_batch_scheduler
+-from app.routers import users, agents, meetings, campaigns, audience, call_recordings, phone_numbers, vobiz, plivo, analytics, integrations, custom_llm_integrations, members, knowledge, rag, batches
++from app.routers import users, agents, meetings, campaigns, audience, call_recordings, phone_numbers, vobiz, plivo, analytics, integrations, custom_llm_integrations, members, knowledge, rag, batches, glific
+ import logging
+ 
+ # Configure logging
+@@ -51,6 +51,7 @@ app.include_router(members.router, prefix=settings.API_V1_PREFIX)
+ app.include_router(knowledge.router, prefix=settings.API_V1_PREFIX)
+ app.include_router(rag.router, prefix=settings.API_V1_PREFIX)
+ app.include_router(batches.router, prefix=settings.API_V1_PREFIX)
++app.include_router(glific.router, prefix=settings.API_V1_PREFIX)
+ 
+ @app.on_event("startup")
+ async def startup_event():
+diff --git a/voicera_backend/app/models/schemas.py b/voicera_backend/app/models/schemas.py
+index 938ded5..9163853 100644
+--- a/voicera_backend/app/models/schemas.py
++++ b/voicera_backend/app/models/schemas.py
+@@ -521,3 +521,67 @@ class BatchScheduleRequest(BaseModel):
+     timezone: str
+     agent_type: Optional[str] = None
+     concurrency: Optional[int] = Field(default=None, ge=1, le=20)
++
++
++# --- Sajag / Glific webhook (SaveLIFE Foundation WhatsApp integration) ---
++#
++# PROVISIONAL: field names below reflect what's validated so far (per the
++# 9 Jul architecture note and the concept note's "Capture & data model" section),
++# NOT a confirmed Glific payload contract. Glific's own source stores lat/long on
++# the contact record when a citizen shares location — how exactly that reaches this
++# webhook (inline in the same payload vs. a separate call) is still unconfirmed
++# (open item "i" from the 9 Jul note). Update this model, not the router logic,
++# once that's confirmed.
++
++class GlificLocation(BaseModel):
++    """Location as captured natively by Glific when a citizen shares it on WhatsApp."""
++    latitude: float
++    longitude: float
++    accuracy_meters: Optional[float] = None
++
++
++class GlificWebhookPayload(BaseModel):
++    """
++    Inbound payload from Glific for a single Sajag hazard report.
++
++    PROVISIONAL SHAPE — swap this out once the Glific team confirms their actual
++    webhook contract (expected later this week per the 14 Jul call). In particular:
++    contact_phone may not be raw E.164, and voice_note_url / photo_url may arrive as
++    Glific media IDs rather than direct URLs.
++    """
++    glific_contact_id: str
++    contact_phone: str  # raw, hashed server-side before storage — never stored as-is
++    channel: str = "whatsapp"
++    language_id: Optional[str] = "hi"  # AI4Bharat needs this explicit; Glific doesn't auto-detect either
++    message_text: Optional[str] = None
++    voice_note_url: Optional[str] = None
++    photo_url: Optional[str] = None
++    location: Optional[GlificLocation] = None
++    consent_given: bool = False
++    received_at: Optional[str] = None  # ISO timestamp from Glific; server sets one if absent
++
++
++class SajagReportResponse(BaseModel):
++    """A stored Sajag report, as returned to internal/dashboard consumers."""
++    report_id: str
++    glific_contact_id: str
++    contact_phone_hash: str
++    channel: str
++    language_id: Optional[str] = None
++    transcription: Optional[str] = None
++    hazard_tags: Optional[List[str]] = None
++    latitude: Optional[float] = None
++    longitude: Optional[float] = None
++    location_accuracy_meters: Optional[float] = None
++    photo_url: Optional[str] = None
++    triangulation_tier: Optional[str] = None  # Confirmed | Emerging | Contextual — NOT computed yet, see status
++    status: str  # Received -> Triaged -> Validated -> Escalated -> In-Progress -> Resolved -> Feedback-Sent
++    received_at: str
++    created_at: str
++    updated_at: str
++
++
++class SajagReportStatusUpdate(BaseModel):
++    """Internal status-update payload (e.g. from the admin dashboard)."""
++    status: str
++    note: Optional[str] = None
+diff --git a/voicera_backend/app/routers/glific.py b/voicera_backend/app/routers/glific.py
+new file mode 100644
+index 0000000..766910b
+--- /dev/null
++++ b/voicera_backend/app/routers/glific.py
+@@ -0,0 +1,221 @@
++"""
++Sajag / Glific webhook routes (SaveLIFE Foundation WhatsApp integration).
++
++This is the new API surface referenced in the 9 Jul architecture note — VoicERA
++was previously telephony-only (Vobiz, Plivo, browser WebSocket, all in
++voice_2_voice_server). This router is a plain REST surface in voicera_backend
++instead, because Glific POSTs discrete WhatsApp events (text/voice-note/photo),
++not a live audio stream.
++
++STATUS AS OF THIS COMMIT — read before deploying:
++  - Confirmed / built: webhook route, request validation, phone-number HMAC
++    hashing, report storage, STT call-out, LLM classification call-out.
++  - Explicitly NOT built (stubs only, see app/services/sajag_pipeline.py):
++    message-text PII redaction, photo face/number-plate redaction.
++  - Explicitly PROVISIONAL, pending confirmation from the Glific team
++    (call was still being scheduled as of 15 Jul):
++      * exact payload shape Glific will actually POST (see GlificWebhookPayload
++        in app/models/schemas.py)
++      * signature/auth scheme Glific supports — this file implements a simple
++        shared-secret header as a placeholder, not a confirmed contract
++      * how a status update gets pushed back to the citizen (SLF's mechanism
++        for this is unknown — see mark_report_status below, which updates our
++        own record but does not yet notify Glific/the citizen of anything)
++      * whether triangulation-tier scoring happens here or on SLF's side
++
++Do not point this at a real SLF/Glific instance without re-reading the above.
++"""
++import base64
++import logging
++from typing import Any, Dict, List, Optional
++
++import httpx
++from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
++
++from app.auth import get_current_user
++from app.config import settings
++from app.models.schemas import (
++    GlificWebhookPayload,
++    SajagReportResponse,
++    SajagReportStatusUpdate,
++)
++from app.services import sajag_hashing, sajag_pipeline, sajag_report_service
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter(prefix="/sajag", tags=["sajag-glific"])
++
++
++async def verify_glific_webhook_secret(
++    x_glific_webhook_secret: Optional[str] = Header(None, alias="X-Glific-Webhook-Secret")
++) -> bool:
++    """
++    PROVISIONAL auth dependency for the inbound Glific webhook.
++
++    A plain shared-secret header is the simplest thing that could work and is
++    easy to swap out — but we do not yet know what Glific actually supports on
++    their side (HMAC-signed body? a different header name? IP allowlisting
++    instead?). Do not treat this as a settled security design.
++    """
++    if not settings.SAJAG_GLIFIC_WEBHOOK_SECRET:
++        logger.error("SAJAG_GLIFIC_WEBHOOK_SECRET not configured — rejecting webhook call.")
++        raise HTTPException(
++            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
++            detail="Sajag webhook secret not configured on this server",
++        )
++    if x_glific_webhook_secret != settings.SAJAG_GLIFIC_WEBHOOK_SECRET:
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail="Invalid or missing X-Glific-Webhook-Secret header",
++        )
++    return True
++
++
++async def _process_voice_note_async(report_id: str, voice_note_url: str, language_id: str) -> None:
++    """
++    Background task: fetch the voice note, transcribe, classify. Runs after the
++    webhook has already returned 202 to Glific, so STT/LLM latency never makes
++    Glific's request time out.
++
++    PROVISIONAL, best-effort: this assumes voice_note_url is a directly fetchable
++    URL. Per open item "i" in the 9 Jul note, we don't actually know that yet —
++    Glific may instead send a media ID requiring a separate authenticated lookup
++    call against their API. If the plain GET below fails, that's the most likely
++    reason. Replace this fetch step once the Glific team confirms the real
++    mechanism; the transcribe/classify/store logic after it should not need to
++    change.
++    """
++    try:
++        async with httpx.AsyncClient(timeout=30) as client:
++            resp = await client.get(voice_note_url)
++            resp.raise_for_status()
++            voice_note_b64 = base64.b64encode(resp.content).decode("utf-8")
++    except httpx.HTTPError as e:
++        logger.error(
++            "Could not fetch voice note for report %s from %s (%s) — this is "
++            "expected until the Glific media-passing mechanism is confirmed.",
++            report_id, voice_note_url, e,
++        )
++        return
++
++    transcription = await sajag_pipeline.transcribe_voice_note(voice_note_b64, language_id)
++    if transcription:
++        # PII redaction runs here, before anything derived from the transcript is
++        # persisted further — but see the loud warning in
++        # sajag_pipeline.redact_message_text(): it is NOT yet implemented.
++        transcription = sajag_pipeline.redact_message_text(transcription)
++
++    hazard_tags = await sajag_pipeline.classify_report(transcription) if transcription else None
++
++    sajag_report_service.update_report_processing(
++        report_id=report_id,
++        transcription=transcription,
++        hazard_tags=hazard_tags,
++    )
++
++
++@router.post("/glific/webhook", status_code=status.HTTP_202_ACCEPTED)
++async def receive_glific_report(
++    payload: GlificWebhookPayload,
++    background_tasks: BackgroundTasks,
++    _: bool = Depends(verify_glific_webhook_secret),
++) -> Dict[str, Any]:
++    """
++    Inbound webhook Glific calls when a citizen submits a Sajag hazard report.
++
++    Per the concept note's user journey: the process only continues if consent
++    was given — Glific is expected to have already gated on this before calling
++    us, but we check again here rather than trusting that silently.
++    """
++    if not payload.consent_given:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail="consent_given must be true — report not stored without consent",
++        )
++
++    try:
++        phone_hash = sajag_hashing.hash_phone_number(payload.contact_phone)
++    except RuntimeError as e:
++        # Fails closed: refuse to store the report rather than store a
++        # reporter's phone number unhashed.
++        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
++
++    message_text = sajag_pipeline.redact_message_text(payload.message_text) if payload.message_text else None
++    photo_url = sajag_pipeline.redact_media(payload.photo_url)
++
++    location_dict = payload.location.dict() if payload.location else None
++
++    report = sajag_report_service.create_report(
++        glific_contact_id=payload.glific_contact_id,
++        contact_phone_hash=phone_hash,
++        channel=payload.channel,
++        language_id=payload.language_id,
++        location=location_dict,
++        photo_url=photo_url,
++        received_at=payload.received_at,
++    )
++
++    # If there's a text message but no voice note, store the (stub-redacted) text
++    # directly rather than waiting on the background task.
++    if message_text and not payload.voice_note_url:
++        sajag_report_service.update_report_processing(report["report_id"], transcription=message_text)
++
++    # Voice note transcription + classification happen after we've already
++    # acknowledged Glific's call, since STT/LLM latency shouldn't block the
++    # webhook response. See _process_voice_note_async's docstring for why the
++    # fetch step inside it is a best-effort guess, not a confirmed contract.
++    if payload.voice_note_url:
++        background_tasks.add_task(
++            _process_voice_note_async,
++            report["report_id"],
++            payload.voice_note_url,
++            payload.language_id or "hi",
++        )
++
++    return {"status": "received", "report_id": report["report_id"]}
++
++
++@router.get("/reports", response_model=List[SajagReportResponse])
++async def list_sajag_reports(
++    status_filter: Optional[str] = None,
++    limit: int = 50,
++    current_user: Dict[str, Any] = Depends(get_current_user),
++) -> List[Dict[str, Any]]:
++    """List Sajag reports for internal/dashboard use. Protected — same auth as the
++    rest of the admin-facing API, not the webhook secret."""
++    return sajag_report_service.list_reports(status=status_filter, limit=limit)
++
++
++@router.get("/reports/{report_id}", response_model=SajagReportResponse)
++async def get_sajag_report(
++    report_id: str,
++    current_user: Dict[str, Any] = Depends(get_current_user),
++) -> Dict[str, Any]:
++    report = sajag_report_service.get_report(report_id)
++    if not report:
++        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
++    return report
++
++
++@router.patch("/reports/{report_id}/status", response_model=SajagReportResponse)
++async def update_sajag_report_status(
++    report_id: str,
++    body: SajagReportStatusUpdate,
++    current_user: Dict[str, Any] = Depends(get_current_user),
++) -> Dict[str, Any]:
++    """
++    Update a report's status (e.g. Triaged -> Validated -> Escalated).
++
++    NOTE: this only updates our own record. It does NOT notify Glific or the
++    citizen — per open item "f" in the 9 Jul note, how a status change gets
++    communicated back to the reporter is still undesigned and depends on a
++    mechanism SLF hasn't specified yet. Closing that loop (Section 5, step 5 of
++    the concept note) is not implemented by this endpoint.
++    """
++    try:
++        report = sajag_report_service.update_report_status(report_id, body.status, body.note)
++    except ValueError as e:
++        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
++    if not report:
++        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
++    return report
+diff --git a/voicera_backend/app/services/sajag_hashing.py b/voicera_backend/app/services/sajag_hashing.py
+new file mode 100644
+index 0000000..c2c24a0
+--- /dev/null
++++ b/voicera_backend/app/services/sajag_hashing.py
+@@ -0,0 +1,64 @@
++"""
++Phone number hashing for Sajag reports.
++
++Deliberately NOT reusing the pattern in app/services/knowledge_service.py
++(`hashlib.sha256(org_id.encode()).hexdigest()[:48]`) — that's an unkeyed hash,
++which is fine for an org_id (high-entropy, not worth reversing) but wrong for a
++phone number. A 10-digit Indian mobile number has only ~10 billion possible
++values, so an unkeyed SHA-256 of it can be reversed in seconds with a precomputed
++table. A keyed HMAC cannot be reversed without the secret key, even though the
++input space is exactly as small.
++
++This was flagged explicitly in the 9 Jul architecture note (item c) as something
++to fix, not copy.
++"""
++import hashlib
++import hmac
++import logging
++import re
++
++from app.config import settings
++
++logger = logging.getLogger(__name__)
++
++
++def _normalize_phone(raw_phone: str) -> str:
++    """
++    Strip all non-digit characters and normalize to a bare-digits, country-code-
++    included form, so the same reporter hashes identically regardless of whether
++    Glific sends "+91 98765 43210", "919876543210", or "9876543210".
++
++    Assumes India (91) when no country code is present — reasonable for a
++    WhatsApp-based India road-safety platform, but flag if Sajag ever needs to
++    handle non-Indian numbers.
++    """
++    digits = re.sub(r"\D", "", raw_phone.strip())
++    if len(digits) == 10:
++        digits = f"91{digits}"
++    return digits
++
++
++def hash_phone_number(raw_phone: str) -> str:
++    """
++    Return a keyed HMAC-SHA256 hex digest of a phone number.
++
++    Raises RuntimeError if SAJAG_GLIFIC_WEBHOOK_SECRET isn't configured — this is
++    intentional. We should refuse to store a report rather than silently fall back
++    to an unkeyed (effectively reversible) hash for a vulnerable reporter's phone
++    number. See Section 8 (Data Protection, Ethics & Safeguarding) of the Sajag
++    concept note.
++    """
++    secret = settings.SAJAG_GLIFIC_WEBHOOK_SECRET
++    if not secret:
++        logger.error(
++            "SAJAG_GLIFIC_WEBHOOK_SECRET is not configured — refusing to hash "
++            "phone number. Set it in .env before accepting live Sajag reports."
++        )
++        raise RuntimeError("SAJAG_GLIFIC_WEBHOOK_SECRET is not configured")
++
++    normalized = _normalize_phone(raw_phone)
++    return hmac.new(
++        key=secret.encode("utf-8"),
++        msg=normalized.encode("utf-8"),
++        digestmod=hashlib.sha256,
++    ).hexdigest()
+diff --git a/voicera_backend/app/services/sajag_pipeline.py b/voicera_backend/app/services/sajag_pipeline.py
+new file mode 100644
+index 0000000..ac19816
+--- /dev/null
++++ b/voicera_backend/app/services/sajag_pipeline.py
+@@ -0,0 +1,118 @@
++"""
++Sajag processing pipeline: transcription + hazard classification for a single
++inbound report. Deliberately calls ai4bharat_stt_server and llm_server directly
++over HTTP rather than going through the Pipecat pipeline in voice_2_voice_server —
++that pipeline is built for live streaming telephony audio (WebSocket frames), not
++a single discrete voice note arriving via webhook. See README_sajag_glific.md for
++why this is a separate call path.
++"""
++import logging
++from typing import List, Optional
++
++import httpx
++
++from app.config import settings
++
++logger = logging.getLogger(__name__)
++
++
++async def transcribe_voice_note(audio_b64: str, language_id: str = "hi") -> Optional[str]:
++    """
++    Call ai4bharat_stt_server's POST /transcribe.
++
++    Verified against the actual server code (ai4bharat_stt_server/server.py):
++    request body is {"audio_b64": ..., "language_id": ...}, response is {"text": ...}.
++    """
++    url = f"{settings.SAJAG_STT_SERVER_URL.rstrip('/')}/transcribe"
++    try:
++        async with httpx.AsyncClient(timeout=60) as client:
++            resp = await client.post(url, json={"audio_b64": audio_b64, "language_id": language_id})
++            resp.raise_for_status()
++            return resp.json().get("text")
++    except httpx.HTTPError as e:
++        logger.error(f"STT call to {url} failed: {e}")
++        return None
++
++
++async def classify_report(text: str) -> Optional[List[str]]:
++    """
++    Call llm_server's OpenAI-compatible /v1/chat/completions endpoint to tag a
++    report against a hazard taxonomy.
++
++    PROVISIONAL: the hazard taxonomy itself isn't defined anywhere in the concept
++    note or the 9 Jul architecture note beyond the three triangulation tiers
++    (Confirmed/Emerging/Contextual, which are a separate, unscored field — see
++    sajag_report_service.py). The tag list below is a starting placeholder, not a
++    confirmed taxonomy — needs sign-off before this is treated as real classification
++    output rather than a rough first pass.
++    """
++    if not text:
++        return None
++
++    placeholder_taxonomy = [
++        "missing_signage", "no_footpath", "unmarked_crossing", "poor_lighting",
++        "blind_merge", "speeding_reported", "median_gap", "other",
++    ]
++
++    url = f"{settings.SAJAG_LLM_SERVER_URL.rstrip('/')}/v1/chat/completions"
++    system_prompt = (
++        "You are classifying a road-safety hazard report from a citizen WhatsApp "
++        "message for SaveLIFE Foundation. Given the report text, return the single "
++        f"best-fitting tag from this list, and nothing else: {placeholder_taxonomy}"
++    )
++    try:
++        async with httpx.AsyncClient(timeout=30) as client:
++            resp = await client.post(
++                url,
++                json={
++                    "model": settings.SAJAG_LLM_MODEL,
++                    "messages": [
++                        {"role": "system", "content": system_prompt},
++                        {"role": "user", "content": text},
++                    ],
++                    "max_tokens": 20,
++                    "temperature": 0,
++                },
++            )
++            resp.raise_for_status()
++            data = resp.json()
++            tag = data["choices"][0]["message"]["content"].strip()
++            return [tag] if tag in placeholder_taxonomy else ["other"]
++    except (httpx.HTTPError, KeyError, IndexError) as e:
++        logger.error(f"LLM classification call to {url} failed: {e}")
++        return None
++
++
++def redact_message_text(text: str) -> str:
++    """
++    NOT IMPLEMENTED. Per open item "d" in the 9 Jul architecture note, redacting
++    PII that might appear inside free-text message content (names, other people's
++    phone numbers, etc. — separate from the reporter's own phone number, which is
++    hashed in sajag_hashing.py) needs a scoping decision before it can be built or
++    estimated. This function currently returns the text unchanged and logs a
++    warning so it can never be silently mistaken for working redaction.
++
++    DO NOT wire this report pipeline into anything citizen-facing or
++    government-facing until this is actually implemented — see Section 8 of the
++    concept note (Data Protection, Ethics & Safeguarding): "no reporter can be
++    exposed to retaliation or identified in any government-facing output."
++    """
++    logger.warning(
++        "redact_message_text() is a stub — message text is being stored/forwarded "
++        "WITHOUT PII redaction. Do not use for real reports until this is built."
++    )
++    return text
++
++
++def redact_media(photo_url: Optional[str]) -> Optional[str]:
++    """
++    NOT IMPLEMENTED. Per open item "e" in the 9 Jul architecture note, automated
++    face/number-plate redaction in photos has no existing foundation in VoicERA and
++    needs its own technical evaluation. This function is a pass-through stub only.
++    """
++    if photo_url:
++        logger.warning(
++            "redact_media() is a stub — photo is being stored/forwarded WITHOUT "
++            "face/number-plate redaction."
++        )
++    return photo_url
+diff --git a/voicera_backend/app/services/sajag_report_service.py b/voicera_backend/app/services/sajag_report_service.py
+new file mode 100644
+index 0000000..474ebfb
+--- /dev/null
++++ b/voicera_backend/app/services/sajag_report_service.py
+@@ -0,0 +1,122 @@
++"""
++Sajag report storage.
++
++Stores hazard reports coming in from the Glific/WhatsApp webhook in their own
++collection ("SajagReports") rather than reusing the agents/calls collections —
++this is a distinct entity with its own lifecycle (see status workflow in the
++concept note's "Capture & data model" section: Received -> Triaged -> Validated
++-> Escalated -> In-Progress -> Resolved -> Feedback-Sent).
++"""
++import logging
++import uuid
++from datetime import datetime
++from typing import Any, Dict, List, Optional
++
++from app.database import get_database
++
++logger = logging.getLogger(__name__)
++
++COLLECTION_NAME = "SajagReports"
++
++VALID_STATUSES = [
++    "Received",
++    "Triaged",
++    "Validated",
++    "Escalated",
++    "In-Progress",
++    "Resolved",
++    "Feedback-Sent",
++]
++
++
++def create_report(
++    glific_contact_id: str,
++    contact_phone_hash: str,
++    channel: str,
++    language_id: Optional[str],
++    location: Optional[Dict[str, Any]],
++    photo_url: Optional[str],
++    received_at: Optional[str],
++) -> Dict[str, Any]:
++    """Create a new Sajag report in status 'Received'. Transcription/classification
++    are filled in afterwards by the pipeline (see sajag_pipeline.py) — a report is
++    stored immediately even if STT/LLM processing hasn't finished, so we never lose
++    an inbound report to a downstream failure."""
++    db = get_database()
++    collection = db[COLLECTION_NAME]
++
++    now = datetime.utcnow().isoformat()
++    report_id = str(uuid.uuid4())
++
++    doc = {
++        "report_id": report_id,
++        "glific_contact_id": glific_contact_id,
++        "contact_phone_hash": contact_phone_hash,
++        "channel": channel,
++        "language_id": language_id,
++        "transcription": None,
++        "hazard_tags": None,
++        "latitude": location.get("latitude") if location else None,
++        "longitude": location.get("longitude") if location else None,
++        "location_accuracy_meters": location.get("accuracy_meters") if location else None,
++        "photo_url": photo_url,
++        # Triangulation tier (Confirmed / Emerging / Contextual) is NOT computed here.
++        # Per open item "h" in the 9 Jul note, whether that scoring happens on
++        # VoicERA's side or SLF's is still unconfirmed. Left null until that's decided.
++        "triangulation_tier": None,
++        "status": "Received",
++        "received_at": received_at or now,
++        "created_at": now,
++        "updated_at": now,
++    }
++
++    collection.insert_one(doc)
++    logger.info(f"Created Sajag report {report_id} for contact {glific_contact_id}")
++    return doc
++
++
++def update_report_processing(
++    report_id: str,
++    transcription: Optional[str] = None,
++    hazard_tags: Optional[List[str]] = None,
++) -> Optional[Dict[str, Any]]:
++    """Attach STT transcription / LLM classification results to an existing report."""
++    db = get_database()
++    collection = db[COLLECTION_NAME]
++
++    update_fields: Dict[str, Any] = {"updated_at": datetime.utcnow().isoformat()}
++    if transcription is not None:
++        update_fields["transcription"] = transcription
++    if hazard_tags is not None:
++        update_fields["hazard_tags"] = hazard_tags
++
++    collection.update_one({"report_id": report_id}, {"$set": update_fields})
++    return get_report(report_id)
++
++
++def update_report_status(report_id: str, status: str, note: Optional[str] = None) -> Optional[Dict[str, Any]]:
++    if status not in VALID_STATUSES:
++        raise ValueError(f"Invalid status '{status}'. Must be one of {VALID_STATUSES}")
++
++    db = get_database()
++    collection = db[COLLECTION_NAME]
++
++    update_fields = {"status": status, "updated_at": datetime.utcnow().isoformat()}
++    if note:
++        update_fields["status_note"] = note
++
++    collection.update_one({"report_id": report_id}, {"$set": update_fields})
++    logger.info(f"Sajag report {report_id} status -> {status}")
++    return get_report(report_id)
++
++
++def get_report(report_id: str) -> Optional[Dict[str, Any]]:
++    db = get_database()
++    return db[COLLECTION_NAME].find_one({"report_id": report_id}, {"_id": 0})
++
++
++def list_reports(status: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
++    db = get_database()
++    query = {"status": status} if status else {}
++    cursor = db[COLLECTION_NAME].find(query, {"_id": 0}).sort("created_at", -1).limit(limit)
++    return list(cursor)
+diff --git a/voicera_backend/env.example b/voicera_backend/env.example
+index bdc2d76..a40b05c 100644
+--- a/voicera_backend/env.example
++++ b/voicera_backend/env.example
+@@ -35,3 +35,16 @@ VOBIZ_API_BASE_URL=your-vobiz-base-url
+ VOBIZ_ACCOUNT_ID=your-vobiz-account-id
+ VOBIZ_AUTH_ID=your-vobiz-auth-id
+ VOBIZ_AUTH_TOKEN=your-vobiz-auth-token
++
++# Sajag / Glific webhook (SaveLIFE Foundation WhatsApp integration) — PROVISIONAL
++# Shared secret Glific must send back on every webhook call (see app/routers/glific.py).
++# Placeholder until the Glific team confirms their actual signing/auth mechanism.
++# Generate one for local testing: python -c "import secrets; print(secrets.token_urlsafe(32))"
++SAJAG_GLIFIC_WEBHOOK_SECRET=your-glific-webhook-shared-secret
++
++# ai4bharat_stt_server instance to use for transcribing Sajag voice notes
++SAJAG_STT_SERVER_URL=http://localhost:8001
++
++# llm_server (vLLM, OpenAI-compatible) instance to use for hazard classification
++SAJAG_LLM_SERVER_URL=http://localhost:8003
++SAJAG_LLM_MODEL=Qwen/Qwen3-8B
+-- 
+2.43.0
+
+
+From 883023d195c89b1dee000848dee1332a582f816d Mon Sep 17 00:00:00 2001
+From: Kislaya Srivastava <kislaya@coss.org.in>
+Date: Wed, 15 Jul 2026 13:17:47 +0000
+Subject: [PATCH 2/2] Sajag dashboard UI + demo data seed script
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Frontend (voicera_frontend, Next.js App Router):
+- app/(dashboard)/sajag/page.tsx — reports table (status/tier badges, hazard
+  tags, location -> Google Maps link, truncated transcript), detail dialog
+  (full transcript, photo, status-update control), empty state that's honest
+  about needing either live Glific data or the seed script below
+- app/api/sajag/reports/**/route.ts — Next.js proxy routes to the backend's
+  /api/v1/sajag/reports* endpoints, mirroring the existing app/api/batches
+  proxy pattern (forwards Authorization header, no logic duplicated)
+- lib/api.ts — SajagReport type + getSajagReports/getSajagReport/
+  updateSajagReportStatus, mirroring the getBatches convention
+- components/app-sidebar.tsx — new 'Sajag Reports' nav item
+
+Backend:
+- voicera_backend/scripts/seed_sajag_demo_data.py — seeds realistic demo
+  reports (drawn from the concept note's own example scenarios) through the
+  real create_report/update_report_processing/hashing code path, so the
+  dashboard can be demoed as a standalone PoC before the Glific integration
+  is live. Clearly commented as demo data, not a pipeline simulation.
+
+Verified: npx tsc --noEmit run across the whole frontend — zero new type
+errors introduced by these files (confirmed by diffing against the same
+check with these changes stashed: 60 pre-existing errors in unrelated files
+either way, none in the files touched here).
+
+Not done: no charts/analytics view, no CSV export, no live map (Google Maps
+link only) — kept to what's needed to review and triage individual reports.
+---
+ .../scripts/seed_sajag_demo_data.py           | 154 +++++++
+ .../app/(dashboard)/sajag/page.tsx            | 431 ++++++++++++++++++
+ .../app/api/sajag/reports/[reportId]/route.ts |  48 ++
+ .../sajag/reports/[reportId]/status/route.ts  |  56 +++
+ .../app/api/sajag/reports/route.ts            |  49 ++
+ voicera_frontend/components/app-sidebar.tsx   |   6 +
+ voicera_frontend/lib/api.ts                   |  96 ++++
+ 7 files changed, 840 insertions(+)
+ create mode 100644 voicera_backend/scripts/seed_sajag_demo_data.py
+ create mode 100644 voicera_frontend/app/(dashboard)/sajag/page.tsx
+ create mode 100644 voicera_frontend/app/api/sajag/reports/[reportId]/route.ts
+ create mode 100644 voicera_frontend/app/api/sajag/reports/[reportId]/status/route.ts
+ create mode 100644 voicera_frontend/app/api/sajag/reports/route.ts
+
+diff --git a/voicera_backend/scripts/seed_sajag_demo_data.py b/voicera_backend/scripts/seed_sajag_demo_data.py
+new file mode 100644
+index 0000000..d686147
+--- /dev/null
++++ b/voicera_backend/scripts/seed_sajag_demo_data.py
+@@ -0,0 +1,154 @@
++"""
++Seed realistic-looking demo data into the SajagReports collection.
++
++Purpose: let the Sajag dashboard (voicera_frontend/app/(dashboard)/sajag) be
++demoed as a standalone Proof of Concept — e.g. to Karthik/Madhu, or to SLF
++themselves — without waiting for the real Glific integration to go live.
++
++This is clearly demo data, not a simulation of a working pipeline:
++  - Report text is written directly (not actually run through STT)
++  - Hazard tags are assigned directly (not actually run through the LLM
++    classifier in app/services/sajag_pipeline.py)
++  - Phone numbers are fake, but still hashed through the real
++    app/services/sajag_hashing.py so the storage layer being demoed is real
++  - Locations are real coordinates along Indian highways, for visual realism
++    on the map links, but are not tied to any actual SLF corridor data
++
++Run from voicera_backend/:
++    python scripts/seed_sajag_demo_data.py
++    python scripts/seed_sajag_demo_data.py --wipe   # clear existing demo data first
++
++Requires SAJAG_GLIFIC_WEBHOOK_SECRET to be set in .env (same requirement as
++the real webhook — the hashing utility refuses to run without it).
++"""
++import argparse
++import sys
++from datetime import datetime, timedelta
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++
++from app.database import get_database  # noqa: E402
++from app.services import sajag_hashing, sajag_report_service  # noqa: E402
++
++# Scenarios drawn directly from the concept note's own illustrative examples
++# (Section 4, "The user journey") plus a few more spanning all three
++# triangulation tiers and several statuses, so the dashboard doesn't look
++# artificially uniform.
++DEMO_REPORTS = [
++    {
++        "phone": "9812300001",
++        "text": "There is no footpath near the school crossing on NH48. Children have to walk on the highway shoulder every morning.",
++        "tags": ["no_footpath"],
++        "lat": 19.0822, "lng": 72.8811,
++        "tier": "Confirmed",
++        "status": "Escalated",
++        "days_ago": 6,
++    },
++    {
++        "phone": "9812300002",
++        "text": "Missing median gap barrier near the village turn — two-wheelers cut across into oncoming traffic constantly.",
++        "tags": ["median_gap"],
++        "lat": 18.9982, "lng": 73.1197,
++        "tier": "Confirmed",
++        "status": "In-Progress",
++        "days_ago": 9,
++    },
++    {
++        "phone": "9812300003",
++        "text": "The shoulder near the bus stop has no lighting at all. Women from our village avoid walking there after dark.",
++        "tags": ["poor_lighting"],
++        "lat": 19.2183, "lng": 72.9781,
++        "tier": "Emerging",
++        "status": "Validated",
++        "days_ago": 4,
++    },
++    {
++        "phone": "9812300004",
++        "text": "Tractors from the farms merge directly onto the expressway with no visibility of oncoming traffic. Almost had an accident last week.",
++        "tags": ["blind_merge"],
++        "lat": 18.6298, "lng": 73.7997,
++        "tier": "Emerging",
++        "status": "Triaged",
++        "days_ago": 2,
++    },
++    {
++        "phone": "9812300005",
++        "text": "Trucks routinely speed through the village stretch, no signage warning them to slow down near the crossing.",
++        "tags": ["speeding_reported", "missing_signage"],
++        "lat": 19.1590, "lng": 72.9989,
++        "tier": "Confirmed",
++        "status": "Resolved",
++        "days_ago": 21,
++    },
++    {
++        "phone": "9812300006",
++        "text": "Unmarked crossing point used daily by workers going to the fields on the other side of the highway.",
++        "tags": ["unmarked_crossing"],
++        "lat": 19.0330, "lng": 73.0297,
++        "tier": "Contextual",
++        "status": "Received",
++        "days_ago": 0,
++    },
++    {
++        "phone": "9812300007",
++        "text": "Same missing footpath issue as before near the school — still not fixed, children still walking on the road.",
++        "tags": ["no_footpath"],
++        "lat": 19.0825, "lng": 72.8815,
++        "tier": "Confirmed",
++        "status": "Feedback-Sent",
++        "days_ago": 30,
++    },
++]
++
++
++def seed(wipe: bool = False) -> None:
++    db = get_database()
++    collection = db[sajag_report_service.COLLECTION_NAME]
++
++    if wipe:
++        result = collection.delete_many({"glific_contact_id": {"$regex": "^demo_"}})
++        print(f"Wiped {result.deleted_count} existing demo report(s).")
++
++    created = 0
++    for i, scenario in enumerate(DEMO_REPORTS, start=1):
++        contact_id = f"demo_contact_{i:03d}"
++        received_at = (datetime.utcnow() - timedelta(days=scenario["days_ago"])).isoformat()
++
++        phone_hash = sajag_hashing.hash_phone_number(scenario["phone"])
++
++        report = sajag_report_service.create_report(
++            glific_contact_id=contact_id,
++            contact_phone_hash=phone_hash,
++            channel="whatsapp",
++            language_id="hi",
++            location={"latitude": scenario["lat"], "longitude": scenario["lng"], "accuracy_meters": 15.0},
++            photo_url=None,
++            received_at=received_at,
++        )
++
++        sajag_report_service.update_report_processing(
++            report["report_id"],
++            transcription=scenario["text"],
++            hazard_tags=scenario["tags"],
++        )
++
++        # create_report/update_report_processing don't set triangulation_tier or
++        # status beyond "Received" — set both directly here since seeding demo
++        # data is a special case, not something the real pipeline does today.
++        collection.update_one(
++            {"report_id": report["report_id"]},
++            {"$set": {"triangulation_tier": scenario["tier"], "status": scenario["status"]}},
++        )
++
++        created += 1
++        print(f"  [{created}/{len(DEMO_REPORTS)}] {contact_id} -> {scenario['status']} ({scenario['tier']})")
++
++    print(f"\nSeeded {created} demo Sajag report(s). View them at /sajag in the dashboard.")
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--wipe", action="store_true", help="Delete existing demo_* reports first")
++    args = parser.parse_args()
++    seed(wipe=args.wipe)
+diff --git a/voicera_frontend/app/(dashboard)/sajag/page.tsx b/voicera_frontend/app/(dashboard)/sajag/page.tsx
+new file mode 100644
+index 0000000..3586512
+--- /dev/null
++++ b/voicera_frontend/app/(dashboard)/sajag/page.tsx
+@@ -0,0 +1,431 @@
++"use client"
++
++import { useCallback, useEffect, useState } from "react"
++import { format } from "date-fns"
++import { Button } from "@/components/ui/button"
++import { Badge } from "@/components/ui/badge"
++import {
++  Card,
++  CardContent,
++  CardDescription,
++  CardHeader,
++  CardTitle,
++} from "@/components/ui/card"
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "@/components/ui/dialog"
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from "@/components/ui/select"
++import {
++  Table,
++  TableBody,
++  TableCell,
++  TableHead,
++  TableHeader,
++  TableRow,
++} from "@/components/ui/table"
++import { Textarea } from "@/components/ui/textarea"
++import {
++  AlertCircle,
++  ExternalLink,
++  Loader2,
++  MapPin,
++  RefreshCw,
++  ShieldAlert,
++} from "lucide-react"
++import {
++  getSajagReports,
++  updateSajagReportStatus,
++  SAJAG_REPORT_STATUSES,
++  type SajagReport,
++  type SajagReportStatus,
++} from "@/lib/api"
++
++// SLF brand accent, per the Sajag concept note (Section 6, Design Principles):
++// "Future UI aligns to SLF brand (deep red #CE2127, not orange)". Used only as
++// an accent within this Sajag-specific view — the rest of the VoicERA admin
++// shell (sidebar, other pages) is unaffected.
++const SLF_RED = "#CE2127"
++
++const STATUS_BADGE_STYLE: Record<SajagReportStatus, string> = {
++  Received: "bg-slate-100 text-slate-700 border-slate-200",
++  Triaged: "bg-blue-50 text-blue-700 border-blue-200",
++  Validated: "bg-indigo-50 text-indigo-700 border-indigo-200",
++  Escalated: "bg-amber-50 text-amber-800 border-amber-200",
++  "In-Progress": "bg-purple-50 text-purple-700 border-purple-200",
++  Resolved: "bg-emerald-50 text-emerald-700 border-emerald-200",
++  "Feedback-Sent": "bg-teal-50 text-teal-700 border-teal-200",
++}
++
++const TIER_BADGE_STYLE: Record<string, string> = {
++  Confirmed: "bg-red-50 text-red-700 border-red-200",
++  Emerging: "bg-orange-50 text-orange-700 border-orange-200",
++  Contextual: "bg-slate-50 text-slate-600 border-slate-200",
++}
++
++const formatTimestamp = (value?: string | null): string => {
++  if (!value) return "—"
++  const parsed = new Date(value)
++  if (Number.isNaN(parsed.getTime())) return "—"
++  return format(parsed, "dd/MM/yyyy, hh:mm a")
++}
++
++const truncate = (value: string | null | undefined, max: number): string => {
++  if (!value) return "—"
++  return value.length > max ? `${value.slice(0, max)}…` : value
++}
++
++export default function SajagReportsPage() {
++  const [reports, setReports] = useState<SajagReport[]>([])
++  const [isLoading, setIsLoading] = useState(true)
++  const [loadError, setLoadError] = useState<string | null>(null)
++  const [statusFilter, setStatusFilter] = useState<string>("all")
++  const [selectedReport, setSelectedReport] = useState<SajagReport | null>(null)
++  const [pendingStatus, setPendingStatus] = useState<SajagReportStatus | "">("")
++  const [statusNote, setStatusNote] = useState("")
++  const [isUpdatingStatus, setIsUpdatingStatus] = useState(false)
++  const [updateError, setUpdateError] = useState<string | null>(null)
++
++  const loadReports = useCallback(async () => {
++    setIsLoading(true)
++    setLoadError(null)
++    try {
++      const rows = await getSajagReports(
++        statusFilter === "all" ? undefined : statusFilter
++      )
++      setReports(rows)
++    } catch (error) {
++      setLoadError(
++        error instanceof Error ? error.message : "Failed to load Sajag reports"
++      )
++    } finally {
++      setIsLoading(false)
++    }
++  }, [statusFilter])
++
++  useEffect(() => {
++    loadReports()
++  }, [loadReports])
++
++  const openReport = (report: SajagReport) => {
++    setSelectedReport(report)
++    setPendingStatus(report.status)
++    setStatusNote("")
++    setUpdateError(null)
++  }
++
++  const submitStatusUpdate = async () => {
++    if (!selectedReport || !pendingStatus) return
++    setIsUpdatingStatus(true)
++    setUpdateError(null)
++    try {
++      const updated = await updateSajagReportStatus(
++        selectedReport.report_id,
++        pendingStatus,
++        statusNote || undefined
++      )
++      setSelectedReport(updated)
++      setReports((prev) =>
++        prev.map((r) => (r.report_id === updated.report_id ? updated : r))
++      )
++    } catch (error) {
++      setUpdateError(
++        error instanceof Error ? error.message : "Failed to update status"
++      )
++    } finally {
++      setIsUpdatingStatus(false)
++    }
++  }
++
++  return (
++    <div className="flex flex-col gap-6 p-6">
++      <div className="flex flex-wrap items-start justify-between gap-4">
++        <div>
++          <div className="flex items-center gap-2">
++            <ShieldAlert className="h-5 w-5" style={{ color: SLF_RED }} />
++            <h1 className="text-2xl font-semibold tracking-tight">
++              Sajag Reports
++            </h1>
++          </div>
++          <p className="text-sm text-muted-foreground mt-1">
++            Community-reported road hazards via SaveLIFE Foundation&apos;s WhatsApp
++            bot (Glific), routed through VoicERA.
++          </p>
++        </div>
++        <div className="flex items-center gap-2">
++          <Select value={statusFilter} onValueChange={setStatusFilter}>
++            <SelectTrigger className="w-[180px]">
++              <SelectValue placeholder="Filter by status" />
++            </SelectTrigger>
++            <SelectContent>
++              <SelectItem value="all">All statuses</SelectItem>
++              {SAJAG_REPORT_STATUSES.map((s) => (
++                <SelectItem key={s} value={s}>
++                  {s}
++                </SelectItem>
++              ))}
++            </SelectContent>
++          </Select>
++          <Button variant="outline" size="icon" onClick={loadReports} disabled={isLoading}>
++            <RefreshCw className={isLoading ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
++          </Button>
++        </div>
++      </div>
++
++      <Card>
++        <CardHeader>
++          <CardTitle className="text-base">
++            {isLoading ? "Loading…" : `${reports.length} report${reports.length === 1 ? "" : "s"}`}
++          </CardTitle>
++          <CardDescription>
++            Triangulation tier is shown once it&apos;s populated — that scoring
++            step is not yet wired up (open item pending confirmation with SLF on
++            whether it runs here or on their side).
++          </CardDescription>
++        </CardHeader>
++        <CardContent>
++          {loadError && (
++            <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive mb-4">
++              <AlertCircle className="h-4 w-4 shrink-0" />
++              {loadError}
++            </div>
++          )}
++
++          {isLoading ? (
++            <div className="flex items-center justify-center py-16 text-muted-foreground">
++              <Loader2 className="h-5 w-5 animate-spin mr-2" />
++              Loading reports…
++            </div>
++          ) : reports.length === 0 ? (
++            <div className="flex flex-col items-center justify-center gap-2 py-16 text-center text-muted-foreground">
++              <MapPin className="h-8 w-8 mb-1 opacity-50" />
++              <p className="font-medium text-foreground">No reports yet</p>
++              <p className="text-sm max-w-md">
++                Reports appear here once the Glific webhook receives a real
++                submission, or once demo data has been loaded for a walkthrough.
++                See <code className="text-xs bg-muted px-1 py-0.5 rounded">
++                  voicera_backend/scripts/seed_sajag_demo_data.py
++                </code> if you&apos;re setting this up as a standalone PoC.
++              </p>
++            </div>
++          ) : (
++            <Table>
++              <TableHeader>
++                <TableRow>
++                  <TableHead>Received</TableHead>
++                  <TableHead>Status</TableHead>
++                  <TableHead>Tier</TableHead>
++                  <TableHead>Report</TableHead>
++                  <TableHead>Location</TableHead>
++                  <TableHead className="text-right">Actions</TableHead>
++                </TableRow>
++              </TableHeader>
++              <TableBody>
++                {reports.map((report) => (
++                  <TableRow key={report.report_id}>
++                    <TableCell className="whitespace-nowrap text-sm">
++                      {formatTimestamp(report.received_at)}
++                    </TableCell>
++                    <TableCell>
++                      <Badge
++                        variant="outline"
++                        className={STATUS_BADGE_STYLE[report.status] ?? ""}
++                      >
++                        {report.status}
++                      </Badge>
++                    </TableCell>
++                    <TableCell>
++                      {report.triangulation_tier ? (
++                        <Badge
++                          variant="outline"
++                          className={TIER_BADGE_STYLE[report.triangulation_tier] ?? ""}
++                        >
++                          {report.triangulation_tier}
++                        </Badge>
++                      ) : (
++                        <span className="text-xs text-muted-foreground">Not scored</span>
++                      )}
++                    </TableCell>
++                    <TableCell className="max-w-[320px] text-sm">
++                      {truncate(report.transcription, 90)}
++                      {report.hazard_tags && report.hazard_tags.length > 0 && (
++                        <div className="flex flex-wrap gap-1 mt-1">
++                          {report.hazard_tags.map((tag) => (
++                            <Badge key={tag} variant="secondary" className="text-[10px]">
++                              {tag.replace(/_/g, " ")}
++                            </Badge>
++                          ))}
++                        </div>
++                      )}
++                    </TableCell>
++                    <TableCell className="text-sm">
++                      {report.latitude != null && report.longitude != null ? (
++                        <a
++                          href={`https://www.google.com/maps?q=${report.latitude},${report.longitude}`}
++                          target="_blank"
++                          rel="noreferrer"
++                          className="inline-flex items-center gap-1 text-blue-600 hover:underline"
++                        >
++                          <MapPin className="h-3.5 w-3.5" />
++                          {report.latitude.toFixed(4)}, {report.longitude.toFixed(4)}
++                          <ExternalLink className="h-3 w-3" />
++                        </a>
++                      ) : (
++                        <span className="text-muted-foreground">—</span>
++                      )}
++                    </TableCell>
++                    <TableCell className="text-right">
++                      <Button variant="outline" size="sm" onClick={() => openReport(report)}>
++                        View
++                      </Button>
++                    </TableCell>
++                  </TableRow>
++                ))}
++              </TableBody>
++            </Table>
++          )}
++        </CardContent>
++      </Card>
++
++      <Dialog open={!!selectedReport} onOpenChange={(open) => !open && setSelectedReport(null)}>
++        <DialogContent className="max-w-lg">
++          {selectedReport && (
++            <>
++              <DialogHeader>
++                <DialogTitle>Report {selectedReport.report_id.slice(0, 8)}</DialogTitle>
++                <DialogDescription>
++                  Received {formatTimestamp(selectedReport.received_at)} via{" "}
++                  {selectedReport.channel}
++                </DialogDescription>
++              </DialogHeader>
++
++              <div className="space-y-4 text-sm">
++                <div>
++                  <p className="font-medium text-muted-foreground mb-1">Report text</p>
++                  <p className="rounded-md bg-muted p-3">
++                    {selectedReport.transcription || "No transcription available yet."}
++                  </p>
++                </div>
++
++                {selectedReport.hazard_tags && selectedReport.hazard_tags.length > 0 && (
++                  <div>
++                    <p className="font-medium text-muted-foreground mb-1">Hazard tags</p>
++                    <div className="flex flex-wrap gap-1">
++                      {selectedReport.hazard_tags.map((tag) => (
++                        <Badge key={tag} variant="secondary">
++                          {tag.replace(/_/g, " ")}
++                        </Badge>
++                      ))}
++                    </div>
++                  </div>
++                )}
++
++                {selectedReport.photo_url && (
++                  <div>
++                    <p className="font-medium text-muted-foreground mb-1">Photo</p>
++                    {/* eslint-disable-next-line @next/next/no-img-element */}
++                    <img
++                      src={selectedReport.photo_url}
++                      alt="Reported hazard"
++                      className="rounded-md border max-h-64 object-cover"
++                    />
++                    <p className="text-xs text-amber-700 mt-1">
++                      Not yet redacted — face/number-plate redaction is unbuilt (see
++                      status doc). Do not share this image externally as-is.
++                    </p>
++                  </div>
++                )}
++
++                {selectedReport.latitude != null && selectedReport.longitude != null && (
++                  <div>
++                    <p className="font-medium text-muted-foreground mb-1">Location</p>
++                    <a
++                      href={`https://www.google.com/maps?q=${selectedReport.latitude},${selectedReport.longitude}`}
++                      target="_blank"
++                      rel="noreferrer"
++                      className="inline-flex items-center gap-1 text-blue-600 hover:underline"
++                    >
++                      <MapPin className="h-3.5 w-3.5" />
++                      {selectedReport.latitude.toFixed(5)}, {selectedReport.longitude.toFixed(5)}
++                      <ExternalLink className="h-3 w-3" />
++                    </a>
++                  </div>
++                )}
++
++                <div className="grid grid-cols-2 gap-3 text-xs text-muted-foreground">
++                  <div>
++                    <span className="block font-medium text-foreground">Reporter (hashed)</span>
++                    {selectedReport.contact_phone_hash.slice(0, 16)}…
++                  </div>
++                  <div>
++                    <span className="block font-medium text-foreground">Language</span>
++                    {selectedReport.language_id || "—"}
++                  </div>
++                </div>
++
++                <div className="border-t pt-4">
++                  <p className="font-medium text-muted-foreground mb-2">Update status</p>
++                  <div className="flex items-center gap-2">
++                    <Select
++                      value={pendingStatus}
++                      onValueChange={(v) => setPendingStatus(v as SajagReportStatus)}
++                    >
++                      <SelectTrigger className="w-[180px]">
++                        <SelectValue />
++                      </SelectTrigger>
++                      <SelectContent>
++                        {SAJAG_REPORT_STATUSES.map((s) => (
++                          <SelectItem key={s} value={s}>
++                            {s}
++                          </SelectItem>
++                        ))}
++                      </SelectContent>
++                    </Select>
++                    <Button
++                      onClick={submitStatusUpdate}
++                      disabled={isUpdatingStatus || pendingStatus === selectedReport.status}
++                    >
++                      {isUpdatingStatus && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
++                      Update
++                    </Button>
++                  </div>
++                  <Textarea
++                    className="mt-2"
++                    placeholder="Optional note (e.g. what was validated, who it was escalated to)"
++                    value={statusNote}
++                    onChange={(e) => setStatusNote(e.target.value)}
++                    rows={2}
++                  />
++                  <p className="text-xs text-amber-700 mt-2">
++                    This updates VoicERA&apos;s own record only — it does not notify
++                    Glific or the citizen. Closing the loop back to the reporter is
++                    not yet implemented (see status doc).
++                  </p>
++                  {updateError && (
++                    <p className="text-xs text-destructive mt-2">{updateError}</p>
++                  )}
++                </div>
++              </div>
++
++              <DialogFooter>
++                <Button variant="outline" onClick={() => setSelectedReport(null)}>
++                  Close
++                </Button>
++              </DialogFooter>
++            </>
++          )}
++        </DialogContent>
++      </Dialog>
++    </div>
++  )
++}
+diff --git a/voicera_frontend/app/api/sajag/reports/[reportId]/route.ts b/voicera_frontend/app/api/sajag/reports/[reportId]/route.ts
+new file mode 100644
+index 0000000..c6e9492
+--- /dev/null
++++ b/voicera_frontend/app/api/sajag/reports/[reportId]/route.ts
+@@ -0,0 +1,48 @@
++import { NextRequest, NextResponse } from "next/server"
++
++import { SERVER_API_URL } from "@/lib/api-config"
++
++const API_BASE_URL = SERVER_API_URL
++
++type RouteContext = { params: Promise<{ reportId: string }> }
++
++// GET - fetch a single Sajag report, proxies to
++// GET /api/v1/sajag/reports/{report_id} on the backend
++export async function GET(request: NextRequest, context: RouteContext) {
++  try {
++    const authHeader = request.headers.get("Authorization")
++    if (!authHeader) {
++      return NextResponse.json(
++        { error: "Authorization header is required" },
++        { status: 401 }
++      )
++    }
++
++    const { reportId } = await context.params
++    const encodedReportId = encodeURIComponent(reportId)
++
++    const response = await fetch(
++      `${API_BASE_URL}/api/v1/sajag/reports/${encodedReportId}`,
++      {
++        method: "GET",
++        headers: {
++          Accept: "application/json",
++          Authorization: authHeader,
++        },
++      }
++    )
++
++    const data = await response.json().catch(() => ({}))
++    if (!response.ok) {
++      return NextResponse.json(data, { status: response.status })
++    }
++
++    return NextResponse.json(data)
++  } catch (error) {
++    console.error("Error fetching Sajag report:", error)
++    return NextResponse.json(
++      { error: "Internal server error" },
++      { status: 500 }
++    )
++  }
++}
+diff --git a/voicera_frontend/app/api/sajag/reports/[reportId]/status/route.ts b/voicera_frontend/app/api/sajag/reports/[reportId]/status/route.ts
+new file mode 100644
+index 0000000..035b9a6
+--- /dev/null
++++ b/voicera_frontend/app/api/sajag/reports/[reportId]/status/route.ts
+@@ -0,0 +1,56 @@
++import { NextRequest, NextResponse } from "next/server"
++
++import { SERVER_API_URL } from "@/lib/api-config"
++
++const API_BASE_URL = SERVER_API_URL
++
++type RouteContext = { params: Promise<{ reportId: string }> }
++
++// PATCH - update a Sajag report's status, proxies to
++// PATCH /api/v1/sajag/reports/{report_id}/status on the backend.
++//
++// NOTE: this only updates VoicERA's own record. It does not notify Glific or
++// the citizen — see the PATCH handler in voicera_backend/app/routers/glific.py
++// for why (open item "f" from the 9 Jul architecture note: the status-update-
++// to-citizen mechanism is still undesigned).
++export async function PATCH(request: NextRequest, context: RouteContext) {
++  try {
++    const authHeader = request.headers.get("Authorization")
++    if (!authHeader) {
++      return NextResponse.json(
++        { error: "Authorization header is required" },
++        { status: 401 }
++      )
++    }
++
++    const { reportId } = await context.params
++    const encodedReportId = encodeURIComponent(reportId)
++    const body = await request.json()
++
++    const response = await fetch(
++      `${API_BASE_URL}/api/v1/sajag/reports/${encodedReportId}/status`,
++      {
++        method: "PATCH",
++        headers: {
++          "Content-Type": "application/json",
++          Accept: "application/json",
++          Authorization: authHeader,
++        },
++        body: JSON.stringify(body),
++      }
++    )
++
++    const data = await response.json().catch(() => ({}))
++    if (!response.ok) {
++      return NextResponse.json(data, { status: response.status })
++    }
++
++    return NextResponse.json(data)
++  } catch (error) {
++    console.error("Error updating Sajag report status:", error)
++    return NextResponse.json(
++      { error: "Internal server error" },
++      { status: 500 }
++    )
++  }
++}
+diff --git a/voicera_frontend/app/api/sajag/reports/route.ts b/voicera_frontend/app/api/sajag/reports/route.ts
+new file mode 100644
+index 0000000..1ca6b16
+--- /dev/null
++++ b/voicera_frontend/app/api/sajag/reports/route.ts
+@@ -0,0 +1,49 @@
++import { NextRequest, NextResponse } from "next/server"
++
++import { SERVER_API_URL } from "@/lib/api-config"
++
++const API_BASE_URL = SERVER_API_URL
++
++// GET - list Sajag reports (optional status_filter), proxies to
++// GET /api/v1/sajag/reports on the backend (voicera_backend/app/routers/glific.py)
++export async function GET(request: NextRequest) {
++  try {
++    const authHeader = request.headers.get("Authorization")
++    if (!authHeader) {
++      return NextResponse.json(
++        { error: "Authorization header is required" },
++        { status: 401 }
++      )
++    }
++
++    const { searchParams } = new URL(request.url)
++    const statusFilter = searchParams.get("status_filter")
++    const limit = searchParams.get("limit")
++
++    const params = new URLSearchParams()
++    if (statusFilter) params.set("status_filter", statusFilter)
++    if (limit) params.set("limit", limit)
++    const query = params.toString() ? `?${params.toString()}` : ""
++
++    const response = await fetch(`${API_BASE_URL}/api/v1/sajag/reports${query}`, {
++      method: "GET",
++      headers: {
++        Accept: "application/json",
++        Authorization: authHeader,
++      },
++    })
++
++    const data = await response.json().catch(() => ({}))
++    if (!response.ok) {
++      return NextResponse.json(data, { status: response.status })
++    }
++
++    return NextResponse.json(data)
++  } catch (error) {
++    console.error("Error fetching Sajag reports:", error)
++    return NextResponse.json(
++      { error: "Internal server error" },
++      { status: 500 }
++    )
++  }
++}
+diff --git a/voicera_frontend/components/app-sidebar.tsx b/voicera_frontend/components/app-sidebar.tsx
+index 05ffb22..1007551 100644
+--- a/voicera_frontend/components/app-sidebar.tsx
++++ b/voicera_frontend/components/app-sidebar.tsx
+@@ -15,6 +15,7 @@ import {
+   BookOpen,
+   LogIn,
+   Layers,
++  ShieldAlert,
+ } from "lucide-react"
+ 
+ import {
+@@ -65,6 +66,11 @@ const mainNavItems = [
+     url: "/history",
+     icon: Clock,
+   },
++  {
++    title: "Sajag Reports",
++    url: "/sajag",
++    icon: ShieldAlert,
++  },
+   {
+     title: "Analytics",
+     url: "/analytics",
+diff --git a/voicera_frontend/lib/api.ts b/voicera_frontend/lib/api.ts
+index e63a086..79d2396 100644
+--- a/voicera_frontend/lib/api.ts
++++ b/voicera_frontend/lib/api.ts
+@@ -1634,3 +1634,99 @@ export async function checkUserExists(email: string): Promise<User | null> {
+     return null
+   }
+ }
++
++// --- Sajag / Glific (SaveLIFE Foundation WhatsApp integration) ---
++//
++// NOTE: reports only exist here once the Glific webhook (app/routers/glific.py
++// in voicera_backend) has actually received something, or once the demo seed
++// script has been run — see voicera_backend/scripts/seed_sajag_demo_data.py.
++// This dashboard reads real data; it does not fabricate anything client-side.
++
++export const SAJAG_REPORT_STATUSES = [
++  "Received",
++  "Triaged",
++  "Validated",
++  "Escalated",
++  "In-Progress",
++  "Resolved",
++  "Feedback-Sent",
++] as const
++
++export type SajagReportStatus = (typeof SAJAG_REPORT_STATUSES)[number]
++
++export interface SajagReport {
++  report_id: string
++  glific_contact_id: string
++  contact_phone_hash: string
++  channel: string
++  language_id?: string | null
++  transcription?: string | null
++  hazard_tags?: string[] | null
++  latitude?: number | null
++  longitude?: number | null
++  location_accuracy_meters?: number | null
++  photo_url?: string | null
++  triangulation_tier?: "Confirmed" | "Emerging" | "Contextual" | null
++  status: SajagReportStatus
++  received_at: string
++  created_at: string
++  updated_at: string
++}
++
++export async function getSajagReports(status?: string): Promise<SajagReport[]> {
++  const query = status ? `?status_filter=${encodeURIComponent(status)}` : ""
++  const response = await fetchApiRoute(`/api/sajag/reports${query}`)
++
++  if (!response.ok) {
++    const error = await response.json().catch(() => ({}))
++    throw new Error(
++      (error as { detail?: string }).detail ||
++        (error as { error?: string }).error ||
++        "Failed to fetch Sajag reports"
++    )
++  }
++
++  return response.json()
++}
++
++export async function getSajagReport(reportId: string): Promise<SajagReport> {
++  const response = await fetchApiRoute(
++    `/api/sajag/reports/${encodeURIComponent(reportId)}`
++  )
++
++  if (!response.ok) {
++    const error = await response.json().catch(() => ({}))
++    throw new Error(
++      (error as { detail?: string }).detail ||
++        (error as { error?: string }).error ||
++        "Failed to fetch Sajag report"
++    )
++  }
++
++  return response.json()
++}
++
++export async function updateSajagReportStatus(
++  reportId: string,
++  newStatus: SajagReportStatus,
++  note?: string
++): Promise<SajagReport> {
++  const response = await fetchApiRoute(
++    `/api/sajag/reports/${encodeURIComponent(reportId)}/status`,
++    {
++      method: "PATCH",
++      body: JSON.stringify({ status: newStatus, note }),
++    }
++  )
++
++  if (!response.ok) {
++    const error = await response.json().catch(() => ({}))
++    throw new Error(
++      (error as { detail?: string }).detail ||
++        (error as { error?: string }).error ||
++        "Failed to update Sajag report status"
++    )
++  }
++
++  return response.json()
++}
+-- 
+2.43.0
+
