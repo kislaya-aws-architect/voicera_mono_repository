@@ -1,7 +1,10 @@
 """
 Pydantic models for request/response validation.
 """
-from pydantic import BaseModel, EmailStr, Field
+import re
+from pydantic import BaseModel, EmailStr, Field, field_validator
+
+_GLIFIC_ARTIFACT_RE = re.compile(r"@(?:contact\.fields|results)\.[\w.]+[\s,]*")
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
@@ -559,6 +562,51 @@ class GlificWebhookPayload(BaseModel):
     location: Optional[GlificLocation] = None
     consent_given: bool = False
     received_at: Optional[str] = None  # ISO timestamp from Glific; server sets one if absent
+
+    @field_validator("message_text", "voice_note_url", mode="before")
+    @classmethod
+    def _strip_glific_artifacts(cls, v):
+        """
+        Strips leftover Glific template tokens (e.g. a literal, unresolved
+        "@contact.fields.sajag_text " left sitting in front of the real text).
+
+        Confirmed real, not hypothetical: seen twice on 2026-07-21 testing the
+        multi-input flow's contact-field accumulation — first with a trailing
+        ".value" artifact (fixed by correcting the flow's expression), then
+        again with just the leading "@contact.fields.sajag_text " prefix, which
+        persisted even after the flow was patched to explicitly initialize the
+        field first. Root cause not fully pinned down after two rounds of
+        flow-side fixes — rather than keep guessing at Glific's exact expression
+        evaluation quirks, this strips the whole class of artifact server-side,
+        which is a boundary we control and can verify directly (see the test in
+        today's patch notes), instead of a platform behavior we can only guess at.
+        """
+        if isinstance(v, str):
+            return _GLIFIC_ARTIFACT_RE.sub("", v).strip(" ,") or None
+        return v
+
+    @field_validator("photos", mode="before")
+    @classmethod
+    def _normalize_photos(cls, v):
+        """
+        Accepts either a real list (what our schema expects) or a comma-joined
+        string (what Glific's Contact Field accumulation pattern produces, since
+        contact fields are scalar — confirmed 2026-07-21 when the multi-input
+        flow's `photos` field arrived as a single joined string via
+        set_contact_field, not a JSON array).
+
+        Also strips out anything that isn't a real http(s) URL — a defensive
+        measure against an ALSO-confirmed real bug: a never-before-set contact
+        field referenced in a template can leave the literal unexpanded
+        "@contact.fields.x" text in the value instead of an empty string. Rather
+        than trust the flow to never hit that again, filter it out here too.
+        """
+        if v is None or isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            parts = [p.strip() for p in v.split(",")]
+            return [p for p in parts if p.startswith("http://") or p.startswith("https://")]
+        return v
 
 
 class SajagReportResponse(BaseModel):

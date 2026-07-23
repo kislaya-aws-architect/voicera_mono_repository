@@ -9,7 +9,7 @@ why this is a separate call path.
 import asyncio
 import logging
 import re
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import httpx
 
@@ -158,6 +158,68 @@ def redact_media(photos: Optional[List[str]]) -> Optional[List[str]]:
 
 
 _DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+
+
+async def push_to_margdarshak(report: Dict, contact_phone: str) -> None:
+    """
+    Pushes a processed Sajag report to SLF's Margdarshak dashboard.
+
+    Endpoint, auth, and payload shape confirmed by Pawan (SLF CTO) on
+    2026-07-21 — this is the first CONFIRMED upstream contract, replacing the
+    internal/pull-only API (GET /sajag/reports) that was the only option
+    before today. Currently points at SLF's own TEST key; Pawan confirmed the
+    key changes for production — SAJAG_MARGDARSHAK_API_KEY must be rotated
+    before this runs against real citizen data, not just left on the test key.
+
+    message_text follows the confirmed rule: only VOICE NOTES are translated
+    (VoicERA is a voice platform; translation is a voice-pipeline step).
+    Typed text passes through as-is, never translated. So: translated_text_hi
+    if it exists (voice path), otherwise the raw transcription (text path,
+    which is identical to what the citizen typed, since it was never
+    translated in the first place).
+
+    contact_phone is passed in RAW, not our internally-hashed version — SLF's
+    own sample payload explicitly includes a raw phone number, presumably for
+    their own case-management/follow-up needs. Deliberate, flagged choice: our
+    own stored copy stays hashed as always (see sajag_hashing); the raw number
+    is used only in-memory, for this one outbound call, never additionally
+    persisted here.
+    """
+    message_text = report.get("translated_text_hi") or report.get("transcription")
+    body = {
+        "glific_contact_id": report.get("glific_contact_id"),
+        "contact_phone": contact_phone,
+        "consent_given": True,  # only ever reach here if consent_given was true at intake
+        "message_text": message_text,
+        "photos": report.get("photos") or [],
+        "location": {
+            "latitude": report.get("latitude"),
+            "longitude": report.get("longitude"),
+        },
+    }
+    report_id = report.get("report_id")
+    logger.info(f"Margdarshak push body for report {report_id}: {body}")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                settings.SAJAG_MARGDARSHAK_URL,
+                json=body,
+                headers={"X-API-Key": settings.SAJAG_MARGDARSHAK_API_KEY},
+            )
+            resp.raise_for_status()
+            logger.info(f"Pushed report {report_id} to Margdarshak: HTTP {resp.status_code} — body: {resp.text}")
+    except httpx.HTTPStatusError as e:
+        # The status alone (e.g. "400 BAD REQUEST") doesn't say WHY — the
+        # response body almost always does. Discovered 2026-07-21: the
+        # original except block only logged the exception's string form,
+        # which drops the body entirely, on a real 400 from this exact
+        # endpoint with no way to tell what was wrong with the payload.
+        logger.error(
+            f"Margdarshak push failed for report {report_id}: "
+            f"HTTP {e.response.status_code} — body: {e.response.text}"
+        )
+    except httpx.HTTPError as e:
+        logger.error(f"Margdarshak push failed for report {report_id}: {e}")
 
 
 async def translate_to_hindi(text: str, source_language_id: str = "hi") -> Optional[str]:

@@ -26,11 +26,13 @@ STATUS AS OF THIS COMMIT — read before deploying:
 Do not point this at a real SLF/Glific instance without re-reading the above.
 """
 import base64
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
+from pydantic import ValidationError
 
 from app.auth import get_current_user
 from app.config import settings
@@ -44,6 +46,51 @@ from app.services import sajag_hashing, sajag_pipeline, sajag_report_service
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sajag", tags=["sajag-glific"])
+
+
+async def parse_glific_payload(request: Request) -> GlificWebhookPayload:
+    """
+    Parses the raw request body into GlificWebhookPayload, defensively handling
+    a DOUBLE-ENCODED body — confirmed happening in practice from Glific's real
+    platform on 2026-07-21, not a hypothetical: the POST body arrived as a JSON
+    STRING containing JSON (e.g. the literal text '"{\\"a\\":1}"') rather than an
+    actual JSON object ('{"a":1}'). FastAPI's normal automatic body-parsing
+    correctly rejects this with a "model_attributes_type" Pydantic error, since
+    a string isn't a mapping — so we intercept here and try a second decode
+    before giving up.
+
+    Most likely trigger, unconfirmed: a nested object in the Post Body template
+    (our `location` field) — Glific's own "Call a Webhook" docs only show flat
+    examples (no nesting), and their templating engine may not serialize nested
+    structures correctly. Whatever the platform-side cause, unwrapping
+    defensively here is safer than assuming every future Glific payload will
+    arrive well-formed.
+    """
+    raw_body = await request.body()
+    try:
+        parsed = json.loads(raw_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Body is not valid JSON: {e}"
+        )
+
+    if isinstance(parsed, str):
+        logger.warning("Glific webhook body arrived double-encoded (JSON string containing JSON) — unwrapping.")
+        try:
+            parsed = json.loads(parsed)
+        except json.JSONDecodeError as e:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Body was double-encoded and the inner content is not valid JSON either: {e}",
+            )
+
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Body must be a JSON object")
+
+    try:
+        return GlificWebhookPayload(**parsed)
+    except ValidationError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=e.errors())
 
 
 async def verify_glific_webhook_secret(
@@ -71,22 +118,27 @@ async def verify_glific_webhook_secret(
     return True
 
 
-async def _process_text_report_async(report_id: str, message_text: str, language_id: str) -> None:
+async def _process_text_report_async(report_id: str, message_text: str, language_id: str, contact_phone: str) -> None:
     """
-    Background task: translate + classify a text-only report (no voice note, so no
-    STT step needed). Mirrors _process_voice_note_async's translate+classify+store
-    tail — kept separate rather than shared because the two paths differ in whether
-    transcription is already known up front.
+    Background task: classify a text-only report (no voice note, so no STT step
+    needed), then push to Margdarshak.
+
+    CHANGED 2026-07-21 per SLF's confirmed design: only VOICE NOTES are
+    translated — VoicERA is a voice platform, translation is specifically a
+    voice-pipeline step (STT output -> Hindi). Typed text passes through
+    exactly as the citizen wrote it; translate_to_hindi() is no longer called
+    here. (It was called here before this fix — that was a real gap, not the
+    intended design, now corrected.)
     """
-    translated_text_hi = await sajag_pipeline.translate_to_hindi(message_text, language_id)
     hazard_tags = await sajag_pipeline.classify_report(message_text)
-    sajag_report_service.update_report_processing(
-        report_id, hazard_tags=hazard_tags, translated_text_hi=translated_text_hi
-    )
+    updated_report = sajag_report_service.update_report_processing(report_id, hazard_tags=hazard_tags)
+    if updated_report:
+        await sajag_pipeline.push_to_margdarshak(updated_report, contact_phone)
 
 
 async def _process_voice_note_async(
-    report_id: str, voice_note_url: str, language_id: str, existing_message_text: Optional[str] = None
+    report_id: str, voice_note_url: str, language_id: str, contact_phone: str,
+    existing_message_text: Optional[str] = None
 ) -> None:
     """
     Background task: fetch the voice note, transcribe, classify. Runs after the
@@ -159,18 +211,20 @@ async def _process_voice_note_async(
     )
     hazard_tags = await sajag_pipeline.classify_report(combined_transcription) if combined_transcription else None
 
-    sajag_report_service.update_report_processing(
+    updated_report = sajag_report_service.update_report_processing(
         report_id=report_id,
         transcription=combined_transcription,
         translated_text_hi=translated_text_hi,
         hazard_tags=hazard_tags,
     )
+    if updated_report:
+        await sajag_pipeline.push_to_margdarshak(updated_report, contact_phone)
 
 
 @router.post("/glific/webhook", status_code=status.HTTP_202_ACCEPTED)
 async def receive_glific_report(
-    payload: GlificWebhookPayload,
     background_tasks: BackgroundTasks,
+    payload: GlificWebhookPayload = Depends(parse_glific_payload),
     _: bool = Depends(verify_glific_webhook_secret),
 ) -> Dict[str, Any]:
     """
@@ -222,7 +276,8 @@ async def receive_glific_report(
     # don't race to overwrite each other's output.
     if message_text and not payload.voice_note_url:
         background_tasks.add_task(
-            _process_text_report_async, report["report_id"], message_text, payload.language_id or "hi"
+            _process_text_report_async, report["report_id"], message_text, payload.language_id or "hi",
+            payload.contact_phone,
         )
 
     # Voice note transcription + classification happen after we've already
@@ -235,6 +290,7 @@ async def receive_glific_report(
             report["report_id"],
             payload.voice_note_url,
             payload.language_id or "hi",
+            payload.contact_phone,
             message_text,
         )
 

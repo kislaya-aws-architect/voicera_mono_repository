@@ -68,6 +68,19 @@ class Settings:
     # running for the telephony flow is fine).
     SAJAG_STT_SERVER_URL: str = os.getenv("SAJAG_STT_SERVER_URL", "http://localhost:8001")
 
+    # SLF's Margdarshak dashboard — first CONFIRMED upstream push contract,
+    # shared by Pawan (SLF CTO) on 2026-07-21 (test key), rotated to the
+    # PRODUCTION key + endpoint on 2026-07-22 per Pawan's message. Note this
+    # wasn't just a key rotation — the endpoint PATH changed too
+    # (/awaaz/feedback -> /sajag/feedback), not only the API key. The old
+    # test key/URL are presumed retired; not verified reachable from here.
+    SAJAG_MARGDARSHAK_URL: str = os.getenv(
+        "SAJAG_MARGDARSHAK_URL", "https://ai.savelifefoundation.org/api/slf-q/sajag/feedback"
+    )
+    SAJAG_MARGDARSHAK_API_KEY: str = os.getenv(
+        "SAJAG_MARGDARSHAK_API_KEY", "slf_sajag_48159ff68e2389233e9bfb5e032b67f9"
+    )
+
     # Dedicated English->Hindi NMT service (IndicTrans2), separate from the LLM
     # server used for hazard classification — different model, different contract.
     # Added 2026-07-20 after general-purpose chat LLMs (Qwen2.5 3B/7B via Ollama)
@@ -85,11 +98,13 @@ class Settings:
     @property
     def mongodb_uri(self) -> str:
         """Build MongoDB connection URI."""
-        return (
-            f"mongodb://{self.MONGODB_USER}:{self.MONGODB_PASSWORD}"
-            f"@{self.MONGODB_HOST}:{self.MONGODB_PORT}/{self.MONGODB_DATABASE}"
-            f"?authSource={self.MONGODB_AUTH_SOURCE}"
-        )
+        if self.MONGODB_USER and self.MONGODB_PASSWORD:
+            return (
+                f"mongodb://{self.MONGODB_USER}:{self.MONGODB_PASSWORD}"
+                f"@{self.MONGODB_HOST}:{self.MONGODB_PORT}/{self.MONGODB_DATABASE}"
+                f"?authSource={self.MONGODB_AUTH_SOURCE}"
+            )
+        return f"mongodb://{self.MONGODB_HOST}:{self.MONGODB_PORT}/{self.MONGODB_DATABASE}"
 
 # Global settings instance
 settings = Settings()

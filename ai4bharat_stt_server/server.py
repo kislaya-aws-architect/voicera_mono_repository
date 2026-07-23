@@ -80,7 +80,7 @@ def _required_model_path(env_var_name: str) -> Path:
 
 def load_main_model():
     model_path = _required_model_path("INDIC_NEMO_PATH")
-    model = nemo_asr.models.ASRModel.restore_from(
+    model = EncDecHybridRNNTCTCBPEModel.restore_from(
         restore_path=str(model_path),
         map_location=torch.device(device),   # <-- add this
     )
