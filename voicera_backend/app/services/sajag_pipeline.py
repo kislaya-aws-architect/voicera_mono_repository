@@ -173,10 +173,11 @@ async def push_to_margdarshak(report: Dict, contact_phone: str) -> None:
 
     message_text follows the confirmed rule: only VOICE NOTES are translated
     (VoicERA is a voice platform; translation is a voice-pipeline step).
-    Typed text passes through as-is, never translated. So: translated_text_hi
-    if it exists (voice path), otherwise the raw transcription (text path,
-    which is identical to what the citizen typed, since it was never
-    translated in the first place).
+    Typed text passes through as-is, never translated. So: translated_text_en
+    if it exists (voice path — the Hindi voice note translated to English,
+    corrected direction as of 2026-07-27), otherwise the raw transcription
+    (text path, which is identical to what the citizen typed, since it was
+    never translated in the first place).
 
     contact_phone is passed in RAW, not our internally-hashed version — SLF's
     own sample payload explicitly includes a raw phone number, presumably for
@@ -185,7 +186,7 @@ async def push_to_margdarshak(report: Dict, contact_phone: str) -> None:
     is used only in-memory, for this one outbound call, never additionally
     persisted here.
     """
-    message_text = report.get("translated_text_hi") or report.get("transcription")
+    message_text = report.get("translated_text_en") or report.get("transcription")
     body = {
         "glific_contact_id": report.get("glific_contact_id"),
         "contact_phone": contact_phone,
@@ -222,45 +223,51 @@ async def push_to_margdarshak(report: Dict, contact_phone: str) -> None:
         logger.error(f"Margdarshak push failed for report {report_id}: {e}")
 
 
-async def translate_to_hindi(text: str, source_language_id: str = "hi") -> Optional[str]:
+async def translate_to_english(text: str, source_language_id: str = "hi") -> Optional[str]:
     """
-    Translate report text (already-transcribed voice note, or raw WhatsApp text)
-    into Hindi — per the contract agreed with SLF: whatever language the input
-    arrives in, the stored/forwarded text should be Hindi.
+    Translate a Hindi voice-note transcription into English — per the contract
+    corrected with SLF on 2026-07-27: citizens speak Hindi (the STT model is
+    Hindi-only, so its output is always Devanagari), and SLF's ops team, reading
+    the Margdarshak dashboard, needs English. This function used to run the
+    opposite direction (English -> Hindi) under the name translate_to_hindi(),
+    which was backwards for the real use case — Kislaya and Pawan confirmed
+    this by email 2026-07-27. Renamed, not just rewritten, since the old name
+    would now describe the wrong behavior.
 
-    NEW — there was no translation step in this pipeline before; transcribe_voice_note()
-    only transcribes in the language it's told the audio is in, it does not translate.
+    Trigger condition is the direct inverse of the old function's: skip only if
+    the text contains NO Devanagari at all (already English/Latin, nothing to
+    translate); translate whenever Devanagari is present. Given the STT model
+    is Hindi-only, this means translation now runs on essentially every real
+    voice-note report — the opposite of the old logic, which (also given the
+    Hindi-only STT) was skipping translation on essentially every real report.
 
-    Calls a dedicated IndicTrans2 translation service (SAJAG_TRANSLATION_SERVER_URL),
-    not the general-purpose LLM server classify_report() uses. Switched from an
-    earlier LLM-chat-prompt approach after testing (2026-07-20) showed general chat
-    models (Qwen2.5 3B and 7B via Ollama) produced fluent-looking but inaccurate
-    Hindi — wrong words, invented non-words, one script-mixing glitch. IndicTrans2
-    is purpose-built for translation and verified accurate on the same test sentence.
+    Calls the same dedicated IndicTrans2 translation service
+    (SAJAG_TRANSLATION_SERVER_URL) as before, but the model loaded there needs
+    to be the indic-en variant now, not en-indic — see indictrans_server.py.
+    That's a model swap on the Linux box, not something this function controls.
     """
     if not text:
         return None
 
-    # Check the ACTUAL text content for Devanagari script, not the language_id
-    # metadata field. Found directly during testing (2026-07-20): language_id
-    # reflects the reporter's declared/preferred language — mainly used as the STT
-    # hint for voice notes — not a live signal of what script typed free-text is
-    # actually in. A report with language_id="hi" but English message_text (citizens
-    # code-switch on WhatsApp constantly) was previously skipping translation
-    # entirely and silently storing the English text into translated_text_hi,
-    # mislabeled as if it were the Hindi translation. Checking the text itself is
-    # the only way to know for certain.
-    if _DEVANAGARI_RE.search(text):
-        return text
+    if not _DEVANAGARI_RE.search(text):
+        return text  # already English/Latin — nothing to translate
 
     url = f"{settings.SAJAG_TRANSLATION_SERVER_URL.rstrip('/')}/translate"
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
-                url, json={"text": text, "src_lang": "eng_Latn", "tgt_lang": "hin_Deva"}
+                url, json={"text": text, "src_lang": "hin_Deva", "tgt_lang": "eng_Latn"}
             )
             resp.raise_for_status()
-            return resp.json().get("text")
+            translated = resp.json().get("text")
+            # repr(), not the raw string — translated text routinely contains
+            # embedded newlines (see the "[Voice note - translated]" combine
+            # pattern in glific.py), which would otherwise split this log entry
+            # across multiple lines and break a plain `grep`. Matches how
+            # push_to_margdarshak's existing body log is already grep-safe —
+            # that one happens to get this for free from dict repr.
+            logger.info(f"English translation succeeded: {translated!r}")
+            return translated
     except (httpx.HTTPError, KeyError) as e:
-        logger.error(f"Hindi translation call to {url} failed: {e}")
+        logger.error(f"English translation call to {url} failed: {e}")
         return None

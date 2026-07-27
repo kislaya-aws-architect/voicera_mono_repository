@@ -89,9 +89,9 @@ class Settings:
     SAJAG_TRANSLATION_SERVER_URL: str = os.getenv("SAJAG_TRANSLATION_SERVER_URL", "http://localhost:8004")
 
     # llm_server runs a vLLM OpenAI-compatible server (Qwen3-8B by default).
-    # Used for hazard classification / tagging AND Hindi translation of the
-    # transcribed report text (see sajag_pipeline.translate_to_hindi) — same
-    # endpoint, two different prompts. If this is down, both steps no-op/log.
+    # Used for hazard classification / tagging. Translation runs through a
+    # separate dedicated service (SAJAG_TRANSLATION_SERVER_URL below, see
+    # sajag_pipeline.translate_to_english), not through this LLM server.
     SAJAG_LLM_SERVER_URL: str = os.getenv("SAJAG_LLM_SERVER_URL", "http://localhost:8003")
     SAJAG_LLM_MODEL: str = os.getenv("SAJAG_LLM_MODEL", "Qwen/Qwen3-8B")
 

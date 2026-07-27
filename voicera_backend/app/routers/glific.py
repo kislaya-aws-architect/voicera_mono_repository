@@ -125,10 +125,11 @@ async def _process_text_report_async(report_id: str, message_text: str, language
 
     CHANGED 2026-07-21 per SLF's confirmed design: only VOICE NOTES are
     translated — VoicERA is a voice platform, translation is specifically a
-    voice-pipeline step (STT output -> Hindi). Typed text passes through
-    exactly as the citizen wrote it; translate_to_hindi() is no longer called
-    here. (It was called here before this fix — that was a real gap, not the
-    intended design, now corrected.)
+    voice-pipeline step (Hindi speech -> English text for SLF ops, corrected
+    direction 2026-07-27). Typed text passes through exactly as the citizen
+    wrote it; translate_to_english() is no longer called here. (It was called
+    here before the 07-21 fix — that was a real gap, not the intended design,
+    now corrected.)
     """
     hazard_tags = await sajag_pipeline.classify_report(message_text)
     updated_report = sajag_report_service.update_report_processing(report_id, hazard_tags=hazard_tags)
@@ -195,6 +196,22 @@ async def _process_voice_note_async(
         # sajag_pipeline.redact_message_text(): it is NOT yet implemented.
         transcription = sajag_pipeline.redact_message_text(transcription)
 
+    # Translate BEFORE combining with typed text, not after — corrected 2026-07-27
+    # alongside the direction fix. The old code translated the COMBINED string
+    # (typed English + voice Devanagari mixed together), which is out-of-distribution
+    # for a single-direction NMT model. Translating only the voice-derived
+    # `transcription` (always pure Devanagari, since STT is Hindi-only) keeps the
+    # model's input exactly matching what it was trained on. existing_message_text
+    # is assumed already English (per the voice-only-translation rule) and is
+    # prepended to the translated output the same way it's prepended to the
+    # source-of-record transcription below — untested assumption for mixed-input
+    # cases, since we've not yet had a real report with both typed AND voice input
+    # to confirm this reads naturally end to end.
+    translated_voice = (
+        await sajag_pipeline.translate_to_english(transcription, language_id)
+        if transcription else None
+    )
+
     # Combine rather than overwrite: if the citizen also sent typed text, keep both,
     # clearly labeled, instead of the voice transcription silently replacing it.
     if transcription and existing_message_text:
@@ -202,19 +219,21 @@ async def _process_voice_note_async(
     else:
         combined_transcription = transcription or existing_message_text
 
+    if translated_voice and existing_message_text:
+        translated_text_en = f"{existing_message_text}\n\n[Voice note - translated]\n{translated_voice}"
+    else:
+        translated_text_en = translated_voice or existing_message_text
+
     # transcription stays in the original language (source of record, per the
-    # concept note's data model). translated_text_hi is the SLF-facing Hindi
-    # version — per the agreed contract, always Hindi regardless of input language.
-    translated_text_hi = (
-        await sajag_pipeline.translate_to_hindi(combined_transcription, language_id)
-        if combined_transcription else None
-    )
+    # concept note's data model). translated_text_en is the SLF-facing English
+    # version — corrected 2026-07-27: citizens speak Hindi, SLF ops need English,
+    # this used to run the opposite direction.
     hazard_tags = await sajag_pipeline.classify_report(combined_transcription) if combined_transcription else None
 
     updated_report = sajag_report_service.update_report_processing(
         report_id=report_id,
         transcription=combined_transcription,
-        translated_text_hi=translated_text_hi,
+        translated_text_en=translated_text_en,
         hazard_tags=hazard_tags,
     )
     if updated_report:

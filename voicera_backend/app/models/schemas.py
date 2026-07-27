@@ -617,7 +617,7 @@ class SajagReportResponse(BaseModel):
     channel: str
     language_id: Optional[str] = None
     transcription: Optional[str] = None  # original-language text — source of record, never overwritten
-    translated_text_hi: Optional[str] = None  # Hindi translation of transcription (agreed contract with SLF)
+    translated_text_en: Optional[str] = None  # English translation of the voice-note portion (agreed contract with SLF, corrected 2026-07-27: citizens speak Hindi, SLF ops need English — was backwards before this)
     hazard_tags: Optional[List[str]] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None

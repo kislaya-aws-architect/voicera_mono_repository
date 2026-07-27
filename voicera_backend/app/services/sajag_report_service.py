@@ -55,7 +55,7 @@ def create_report(
         "channel": channel,
         "language_id": language_id,
         "transcription": None,
-        "translated_text_hi": None,
+        "translated_text_en": None,
         "hazard_tags": None,
         "latitude": location.get("latitude") if location else None,
         "longitude": location.get("longitude") if location else None,
@@ -79,10 +79,10 @@ def create_report(
 def update_report_processing(
     report_id: str,
     transcription: Optional[str] = None,
-    translated_text_hi: Optional[str] = None,
+    translated_text_en: Optional[str] = None,
     hazard_tags: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Attach STT transcription / Hindi translation / LLM classification results to
+    """Attach STT transcription / English translation / LLM classification results to
     an existing report."""
     db = get_database()
     collection = db[COLLECTION_NAME]
@@ -90,8 +90,8 @@ def update_report_processing(
     update_fields: Dict[str, Any] = {"updated_at": datetime.utcnow().isoformat()}
     if transcription is not None:
         update_fields["transcription"] = transcription
-    if translated_text_hi is not None:
-        update_fields["translated_text_hi"] = translated_text_hi
+    if translated_text_en is not None:
+        update_fields["translated_text_en"] = translated_text_en
     if hazard_tags is not None:
         update_fields["hazard_tags"] = hazard_tags
 

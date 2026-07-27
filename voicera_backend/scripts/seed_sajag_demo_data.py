@@ -130,7 +130,7 @@ def seed(wipe: bool = False) -> None:
         sajag_report_service.update_report_processing(
             report["report_id"],
             transcription=scenario["text"],
-            translated_text_hi=scenario["text"],  # demo data is already Hindi-language_id; no real translation call
+            translated_text_en=scenario["text"],  # demo data — not a real translation, same placeholder text in both fields
             hazard_tags=scenario["tags"],
         )
 
