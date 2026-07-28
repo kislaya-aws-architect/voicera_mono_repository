@@ -274,7 +274,19 @@ try {
 }
 
 # ── ngrok ──
+# NOTE: ngrok.exe is a very commonly false-positived binary on Windows Defender —
+# confirmed live on a Windows Server 2025 AMI, 2026-07-28 ("the file contains a virus
+# or potentially unwanted software"). Add an exclusion BEFORE downloading/running it;
+# adding one after the fact is less reliable since Defender may have already quarantined
+# the specific file. If Defender itself is policy-managed (same as the execution-policy
+# GPO override seen elsewhere on managed AMIs), Add-MpPreference may fail too — that's
+# handled below as a non-fatal warning with manual remediation steps, not a script-killer.
 New-Item -ItemType Directory -Force -Path "C:\ngrok" | Out-Null
+try {
+    Add-MpPreference -ExclusionPath "C:\ngrok" -ErrorAction Stop
+} catch {
+    Write-Host "  WARN Could not add a Windows Defender exclusion for C:\ngrok (possibly policy-locked on this AMI). If ngrok gets flagged below, fix manually via Windows Security > Virus & threat protection > Protection history (Allow/Restore the ngrok block), or add the exclusion there under Manage settings > Exclusions, then re-run this script." -ForegroundColor Yellow
+}
 if (-not (Get-Command ngrok -ErrorAction SilentlyContinue)) {
     Write-Host "  Installing ngrok..." -ForegroundColor DarkGray
     Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "$env:TEMP\ngrok.zip"
@@ -282,11 +294,20 @@ if (-not (Get-Command ngrok -ErrorAction SilentlyContinue)) {
     [System.Environment]::SetEnvironmentVariable('PATH', $env:PATH + ";C:\ngrok", [System.EnvironmentVariableTarget]::Machine)
     Refresh-Path
 }
-ngrok config add-authtoken $NGROK_TOKEN 2>$null | Out-Null
-ok "ngrok ready"
+try {
+    ngrok config add-authtoken $NGROK_TOKEN 2>$null | Out-Null
+    ok "ngrok ready"
+} catch {
+    Write-Host "  WARN ngrok.exe failed to run — almost certainly Windows Defender blocking it as a false positive, not an actual problem with ngrok. This is non-fatal to the rest of setup, but ngrok tunneling won't work until fixed: go to Windows Security > Virus & threat protection > Protection history, find the ngrok block, choose Actions > Allow/Restore (or add C:\ngrok under Exclusions), then re-run this script." -ForegroundColor Yellow
+}
 
 # ── cloudflared ──
 New-Item -ItemType Directory -Force -Path "C:\cloudflared" | Out-Null
+try {
+    Add-MpPreference -ExclusionPath "C:\cloudflared" -ErrorAction Stop
+} catch {
+    Write-Host "  WARN Could not add a Windows Defender exclusion for C:\cloudflared (possibly policy-locked on this AMI). Same remediation as ngrok above if it gets flagged." -ForegroundColor Yellow
+}
 if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) {
     Write-Host "  Installing cloudflared..." -ForegroundColor DarkGray
     Invoke-WebRequest "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
