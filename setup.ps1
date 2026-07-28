@@ -467,6 +467,17 @@ if ($ENABLE_STT -eq "yes") {
         & "$STT_DIR\venv\Scripts\pip.exe" install -q --no-deps "nemo_toolkit[asr] @ git+https://github.com/AI4Bharat/NeMo.git@nemo-v2" 2>&1 | Select-Object -Last 2
     }
 
+    # Runs even when the venv already existed from an earlier run — "skip if venv
+    # exists" idempotency means a package added to the install list above never
+    # retroactively lands in a venv created before that line existed. Confirmed
+    # live: pytorch-lightning was missing on a box whose STT venv predated this
+    # fix, despite the fix being correctly present in this file.
+    & "$STT_DIR\venv\Scripts\python.exe" -c "import pytorch_lightning" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  pytorch_lightning missing from existing STT venv, installing..." -ForegroundColor DarkGray
+        & "$STT_DIR\venv\Scripts\pip.exe" install -q pytorch-lightning 2>&1 | Select-Object -Last 1
+    }
+
     # Download STT checkpoint
     New-Item -ItemType Directory -Force -Path "$STT_DIR\checkpoints" | Out-Null
     if (-not (Test-Path "$STT_DIR\checkpoints\indic_conformer.nemo")) {
@@ -704,9 +715,16 @@ if (-not (Test-Port 7860)) {
 ok "V2V started (port 7860)"
 
 # ── Frontend ──
+# NOTE: "npm run dev" re-executes package.json's dev script verbatim, which is
+# "WATCHPACK_POLLING=true next dev --webpack --port 3000" — bash-style inline
+# env-var assignment that cmd.exe (what npm shells out to on Windows) cannot
+# parse at all ("'WATCHPACK_POLLING' is not recognized..."). Confirmed live,
+# 2026-07-28. Bypassing npm run entirely and calling next dev directly, with
+# the env var set at the PowerShell level instead, sidesteps this rather than
+# needing package.json itself changed.
 if (-not (Test-Port 3000)) {
     Start-Service-Window "VoicEra Frontend" $FRONTEND_DIR `
-        "npm run dev -- --port 3000"
+        '$env:WATCHPACK_POLLING=''true''; npx next dev --webpack --port 3000'
     Start-Sleep -Seconds 8
 }
 ok "Frontend started (port 3000)"
