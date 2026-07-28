@@ -11,11 +11,12 @@
 #
 # Optional env vars (set before running):
 #   $env:NGROK_TOKEN          get from https://dashboard.ngrok.com/get-started/your-authtoken
-#   $env:HF_TOKEN              (required for TTS — gated model) get from https://huggingface.co/settings/tokens
+#   $env:HF_TOKEN              (required only if ENABLE_TTS=local — gated model) get from https://huggingface.co/settings/tokens
 #   $env:VOBIZ_AUTH_ID         (telephony, legacy — see Section "Telephony" below) get from https://www.vobiz.in dashboard
 #   $env:VOBIZ_AUTH_TOKEN      (telephony, legacy) get from https://www.vobiz.in dashboard
 #   $env:ENABLE_STT            yes|no  (default: yes)
-#   $env:ENABLE_TTS            yes|no  (default: yes)
+#   $env:ENABLE_TTS            local|remote|no  (default: remote — see change #7 below)
+#   $env:TTS_REMOTE_URL        ws://<host>:8002 — required if ENABLE_TTS=remote
 #   $env:ENABLE_LLM            none|openai|grok  (default: openai)
 #   $env:OPENAI_API_KEY
 #   $env:XAI_API_KEY
@@ -59,6 +60,36 @@
 #   6. Vobiz block left functionally unchanged but flagged: Vobiz is being
 #      decommissioned org-wide in favor of Vodafone Vi Business Managed SIP.
 #      Treat these fields as a placeholder pending that cutover.
+#   7. ENABLE_TTS now takes local|remote|no (was yes|no), default changed to
+#      remote. Root cause: the TTS server's inference/paging.py imports
+#      flashinfer, which has no official Windows distribution — see
+#      https://docs.flashinfer.ai/installation.html (Linux-only PyPI wheels)
+#      and https://github.com/SystemPanic/flashinfer-windows (unofficial
+#      Windows builds, only for one exact Python/CUDA/torch combination, or
+#      a from-source build requiring Visual Studio). Confirmed live via
+#      ModuleNotFoundError on a Windows Server 2025 AMI, 2026-07-28. TTS is
+#      already designed to be called remotely (V2V talks to it over
+#      INDIC_TTS_SERVER_URL/ws://), so ENABLE_TTS=remote points this box at
+#      a TTS instance running on a native Linux GPU box instead of fighting
+#      the Windows build — the same pattern already proven for STT/
+#      translation on the Sajag GPU box. ENABLE_TTS=local is left available
+#      for anyone willing to chase the community Windows build, with a
+#      warning printed up front rather than a silent doomed pip install.
+#      Separately, added pytorch-lightning to the STT venv's explicit
+#      install list — its absence caused a live ModuleNotFoundError on the
+#      same run; unlike flashinfer this is an ordinary cross-platform
+#      package, so this actually resolves it rather than working around it.
+#   8. GPU check now attempts an automated driver install (from AWS's own
+#      public ec2-windows-nvidia-drivers S3 bucket, no credentials needed)
+#      instead of just warning. Confirmed live: g4dn.xlarge Windows
+#      instances do not show the T4 in Win32_VideoController pre-driver —
+#      it's a 3D-controller-class PCI device (0x0302), not VGA-class
+#      (0x0300), so it won't appear there even with zero driver installed,
+#      unlike the base Amazon console adapter. Falls back to manual
+#      nvidia.com instructions if the automated path fails for any reason
+#      (there are reports of intermittent 404s against this bucket). Either
+#      way, a reboot is required before nvidia-smi will work — this script
+#      cannot reboot itself mid-run, so re-run it after rebooting.
 # =============================================================================
 #Requires -RunAsAdministrator
 
@@ -79,7 +110,8 @@ try {
 $NGROK_TOKEN    = if ($env:NGROK_TOKEN)     { $env:NGROK_TOKEN }     else { "" } # get from https://dashboard.ngrok.com/get-started/your-authtoken
 $HF_TOKEN       = if ($env:HF_TOKEN)        { $env:HF_TOKEN }        else { "" } # get from https://huggingface.co/settings/tokens
 $ENABLE_STT     = if ($env:ENABLE_STT)      { $env:ENABLE_STT }      else { "yes" }
-$ENABLE_TTS     = if ($env:ENABLE_TTS)      { $env:ENABLE_TTS }      else { "yes" }
+$ENABLE_TTS     = if ($env:ENABLE_TTS)      { $env:ENABLE_TTS }      else { "remote" }  # CHANGED: was "yes" (=local); see change #7
+$TTS_REMOTE_URL = if ($env:TTS_REMOTE_URL)  { $env:TTS_REMOTE_URL }  else { "" }
 $ENABLE_LLM     = if ($env:ENABLE_LLM)      { $env:ENABLE_LLM }      else { "openai" }   # CHANGED: was "none"
 $VOBIZ_AUTH_ID  = if ($env:VOBIZ_AUTH_ID)   { $env:VOBIZ_AUTH_ID }   else { "PLACEHOLDER" } # legacy telephony, pending Vodafone Vi cutover
 $VOBIZ_AUTH_TOKEN = if ($env:VOBIZ_AUTH_TOKEN) { $env:VOBIZ_AUTH_TOKEN } else { "PLACEHOLDER" } # legacy telephony, pending Vodafone Vi cutover
@@ -164,18 +196,27 @@ if ($NGROK_TOKEN -eq "") {
     warn "No ngrok token found. Get one at: https://dashboard.ngrok.com/get-started/your-authtoken"
     $NGROK_TOKEN = Read-Host "  ngrok authtoken"
 }
-if ($ENABLE_TTS -eq "yes" -and $HF_TOKEN -eq "") {
-    warn "No Hugging Face token found. Get one at: https://huggingface.co/settings/tokens"
-    $HF_TOKEN = Read-Host "  Hugging Face token (required for TTS gated model)"
-}
 
 $_stt = Read-Host "  Enable STT? [yes/no, default: $ENABLE_STT]"
 if ($_stt -eq "y") { $_stt = "yes" } elseif ($_stt -eq "n") { $_stt = "no" }
 if ($_stt -ne "") { $ENABLE_STT = $_stt }
 
-$_tts = Read-Host "  Enable TTS? [yes/no, default: $ENABLE_TTS]"
-if ($_tts -eq "y") { $_tts = "yes" } elseif ($_tts -eq "n") { $_tts = "no" }
+Write-Host "  TTS: local | remote | no" -ForegroundColor White
+Write-Host "    local  = run TTS on this box. NOT RECOMMENDED on Windows: TTS depends on" -ForegroundColor DarkGray
+Write-Host "             flashinfer, which has no official Windows build (Linux-only PyPI" -ForegroundColor DarkGray
+Write-Host "             wheels). See the CHANGES FROM UPSTREAM note at the top of this file." -ForegroundColor DarkGray
+Write-Host "    remote = point at a TTS instance already running on a Linux GPU box" -ForegroundColor DarkGray
+$_tts = Read-Host "  TTS mode [default: $ENABLE_TTS]"
 if ($_tts -ne "") { $ENABLE_TTS = $_tts }
+
+if ($ENABLE_TTS -eq "remote" -and $TTS_REMOTE_URL -eq "") {
+    warn "ENABLE_TTS=remote needs the address of a TTS instance already running elsewhere (e.g. the Sajag Linux GPU box)."
+    $TTS_REMOTE_URL = Read-Host "  Remote TTS URL (e.g. ws://100.60.89.2:8002)"
+}
+if ($ENABLE_TTS -eq "local" -and $HF_TOKEN -eq "") {
+    warn "No Hugging Face token found. Get one at: https://huggingface.co/settings/tokens"
+    $HF_TOKEN = Read-Host "  Hugging Face token (required for TTS gated model)"
+}
 
 Write-Host "  LLM: none | openai | grok" -ForegroundColor White
 $_llm = Read-Host "  LLM provider [default: $ENABLE_LLM]"
@@ -264,13 +305,39 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     warn "Relaunch this script in PowerShell 7 (black window) after install completes."
 }
 
-# ── GPU check ──
+# ── GPU check + driver install ──
+# AWS hosts current GPU drivers in a public, unauthenticated S3 bucket for exactly this
+# purpose — no AWS CLI or credentials needed. Documented at
+# https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/install-nvidia-driver.html
+# Silent-install flags confirmed against AWS's own EKS docs for this same driver family:
+# https://docs.aws.amazon.com/eks/latest/userguide/ml-eks-windows-optimized-ami.html
 try {
     $gpuInfo = nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>$null
+    if ($LASTEXITCODE -ne 0) { throw "nvidia-smi not functional" }
     ok "GPU: $gpuInfo"
 } catch {
-    warn "nvidia-smi not found. Install NVIDIA driver before running AI services."
-    warn "Download: https://www.nvidia.com/Download/index.aspx"
+    Write-Host "  NVIDIA driver not found — attempting automated install from AWS's driver bucket..." -ForegroundColor DarkGray
+    $driverInstalled = $false
+    try {
+        $listXml = Invoke-RestMethod "https://ec2-windows-nvidia-drivers.s3.us-east-1.amazonaws.com/?list-type=2&prefix=latest/" -ErrorAction Stop
+        $exeKey = ($listXml.ListBucketResult.Contents | Where-Object { $_.Key -like "*.exe" } | Select-Object -First 1).Key
+        if (-not $exeKey) { throw "No .exe found in bucket listing" }
+        $driverUrl = "https://ec2-windows-nvidia-drivers.s3.us-east-1.amazonaws.com/$exeKey"
+        $driverPath = "$env:TEMP\nvidia_driver.exe"
+        Write-Host "  Downloading $exeKey (large file, can take a few minutes)..." -ForegroundColor DarkGray
+        Invoke-WebRequest $driverUrl -OutFile $driverPath
+        Write-Host "  Installing silently..." -ForegroundColor DarkGray
+        Start-Process -FilePath $driverPath -ArgumentList "-s -clean -noreboot -noeula" -Wait -NoNewWindow
+        $driverInstalled = $true
+    } catch {
+        Write-Host "  WARN Automated driver download/install failed ($($_.Exception.Message))." -ForegroundColor Yellow
+    }
+
+    if ($driverInstalled) {
+        Write-Host "  WARN NVIDIA driver installed but needs a REBOOT to load. Reboot this instance, then re-run this script — nvidia-smi should work afterward. STT/TTS will not use the GPU until you do." -ForegroundColor Yellow
+    } else {
+        Write-Host "  WARN Install manually instead: https://www.nvidia.com/Download/Find.aspx -> Data Center/Tesla, T-Series, Tesla T4 (or your instance's actual GPU), your Windows Server version, Any CUDA Toolkit Version. Reboot after installing, then re-run this script." -ForegroundColor Yellow
+    }
 }
 
 # ── ngrok ──
@@ -396,7 +463,7 @@ if ($ENABLE_STT -eq "yes") {
 
         & "$STT_DIR\venv\Scripts\pip.exe" install -q --upgrade pip 2>&1 | Select-Object -Last 1
         & "$STT_DIR\venv\Scripts\pip.exe" install -q -r requirements.txt 2>&1 | Select-Object -Last 2
-        & "$STT_DIR\venv\Scripts\pip.exe" install -q numba ruamel.yaml scikit-learn tensorboard text-unidecode 2>&1 | Select-Object -Last 1
+        & "$STT_DIR\venv\Scripts\pip.exe" install -q numba ruamel.yaml scikit-learn tensorboard text-unidecode pytorch-lightning 2>&1 | Select-Object -Last 1
         & "$STT_DIR\venv\Scripts\pip.exe" install -q --no-deps "nemo_toolkit[asr] @ git+https://github.com/AI4Bharat/NeMo.git@nemo-v2" 2>&1 | Select-Object -Last 2
     }
 
@@ -415,12 +482,23 @@ BHILI_ENABLE=no
 INDIC_NEMO_PATH=$STT_DIR\checkpoints\indic_conformer.nemo
 HF_TOKEN=$HF_TOKEN
 "@
-    ok "STT ready"
+    # Verify before declaring success — a failed/partial download should not print "ready".
+    $sttCkpt = Get-Item "$STT_DIR\checkpoints\indic_conformer.nemo" -ErrorAction SilentlyContinue
+    if ($sttCkpt -and $sttCkpt.Length -gt 500MB) {
+        ok "STT ready (checkpoint $([math]::Round($sttCkpt.Length/1GB,2)) GB)"
+    } else {
+        Write-Host "  WARN STT checkpoint missing or incomplete at $STT_DIR\checkpoints\indic_conformer.nemo — STT will not start correctly. Re-run this script, or download manually and retry." -ForegroundColor Yellow
+    }
 }
 
 # ── TTS venv ──
-if ($ENABLE_TTS -eq "yes") {
+if ($ENABLE_TTS -eq "local") {
     $TTS_DIR = "$REPO_DIR\ai4bharat_tts_server"
+    Write-Host "  WARN ENABLE_TTS=local: this server needs flashinfer, which has no official" -ForegroundColor Yellow
+    Write-Host "       Windows build (Linux-only PyPI wheels). Attempting install anyway in" -ForegroundColor Yellow
+    Write-Host "       case an unofficial wheel matches your exact Python/CUDA/torch combo —" -ForegroundColor Yellow
+    Write-Host "       expect this to fail on a normal setup. See change #7 at the top of this" -ForegroundColor Yellow
+    Write-Host "       file for the recommended alternative (ENABLE_TTS=remote)." -ForegroundColor Yellow
     if (-not (Test-Path "$TTS_DIR\venv")) {
         Write-Host "  Creating TTS venv..." -ForegroundColor DarkGray
         Set-Location $TTS_DIR
@@ -428,6 +506,11 @@ if ($ENABLE_TTS -eq "yes") {
         & "$TTS_DIR\venv\Scripts\pip.exe" install -q --upgrade pip 2>&1 | Select-Object -Last 1
         & "$TTS_DIR\venv\Scripts\pip.exe" install -q torch transformers==4.46.1 sentencepiece protobuf scipy websockets python-dotenv numpy 2>&1 | Select-Object -Last 2
         & "$TTS_DIR\venv\Scripts\pip.exe" install -q gdown 2>&1 | Select-Object -Last 1
+        try {
+            & "$TTS_DIR\venv\Scripts\pip.exe" install -q flashinfer-python --no-build-isolation 2>&1 | Select-Object -Last 3
+        } catch {
+            Write-Host "  WARN flashinfer install failed, as expected on most Windows setups. TTS will not start until this is resolved — see https://github.com/SystemPanic/flashinfer-windows for the unofficial Windows build path, or switch to ENABLE_TTS=remote." -ForegroundColor Yellow
+        }
     }
 
     # Download TTS checkpoints
@@ -435,7 +518,12 @@ if ($ENABLE_TTS -eq "yes") {
     $ckptFiles = Get-ChildItem "$TTS_DIR\checkpoints" -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 100MB }
     if (-not $ckptFiles) {
         Write-Host "  Downloading TTS checkpoints from Google Drive..." -ForegroundColor DarkGray
-        & "$TTS_DIR\venv\Scripts\python.exe" -m gdown --folder --fuzzy `
+        # NOTE: --fuzzy is only for extracting a file ID out of a single-file *sharing* URL;
+        # it is not valid combined with --folder (which already takes a plain folder URL) and
+        # fails with "unrecognized arguments: --fuzzy" if included — confirmed live against a
+        # Windows Server 2025 AMI, 2026-07-28. Upstream (PRANABraight/voicera_mono_repository)
+        # still has --fuzzy in this call as of that date.
+        & "$TTS_DIR\venv\Scripts\python.exe" -m gdown --folder `
             "https://drive.google.com/drive/folders/1qrh56MWXboiBO38gaWEcWhFl0NzlDiaT" `
             -O "$TTS_DIR\checkpoints" 2>&1 | Select-Object -Last 3
         # Flatten nested folder if gdown created one
@@ -444,6 +532,7 @@ if ($ENABLE_TTS -eq "yes") {
             Get-ChildItem $nested | Move-Item -Destination "$TTS_DIR\checkpoints\"
             Remove-Item $nested -Force
         }
+        $ckptFiles = Get-ChildItem "$TTS_DIR\checkpoints" -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 100MB }
     }
 
     Set-Content -Path "$TTS_DIR\.env" -Value @"
@@ -452,7 +541,15 @@ BHILI_ENABLE=no
 PORT=8002
 HF_TOKEN=$HF_TOKEN
 "@
-    ok "TTS ready"
+    # Verify before declaring success — a failed download should not print "ready".
+    if ($ckptFiles) {
+        ok "TTS ready ($($ckptFiles.Count) checkpoint file(s))"
+    } else {
+        Write-Host "  WARN No TTS checkpoint files found in $TTS_DIR\checkpoints — the download failed. Retry manually: $TTS_DIR\venv\Scripts\python.exe -m gdown --folder https://drive.google.com/drive/folders/1qrh56MWXboiBO38gaWEcWhFl0NzlDiaT -O $TTS_DIR\checkpoints" -ForegroundColor Yellow
+    }
+}
+if ($ENABLE_TTS -eq "remote") {
+    ok "TTS: using remote endpoint $TTS_REMOTE_URL (no local install)"
 }
 
 # ── V2V venv ──
@@ -516,6 +613,11 @@ ok "Frontend ready"
 # Python services actually read at runtime. AI4BHARAT_STT_URL/AI4BHARAT_TTS_URL
 # are upstream's (documented but not live) names — kept below as a harmless
 # fallback only, do not rely on them.
+$ttsUrl = switch ($ENABLE_TTS) {
+    "local"  { "ws://${PRIVATE_IP}:8002" }
+    "remote" { $TTS_REMOTE_URL }
+    default  { "ws://PENDING" }
+}
 Set-Content -Path "$V2V_DIR\.env" -Value @"
 VOBIZ_AUTH_ID=$VOBIZ_AUTH_ID
 VOBIZ_AUTH_TOKEN=$VOBIZ_AUTH_TOKEN
@@ -534,13 +636,13 @@ MINIO_SECURE=false
 BHASHINI_API_KEY=PLACEHOLDER
 BHASHINI_SOCKET_URL=PLACEHOLDER
 INDIC_STT_SERVER_URL=http://${PRIVATE_IP}:8001
-INDIC_TTS_SERVER_URL=ws://${PRIVATE_IP}:8002
+INDIC_TTS_SERVER_URL=$ttsUrl
 AI4BHARAT_STT_URL=http://${PRIVATE_IP}:8001
-AI4BHARAT_TTS_URL=ws://${PRIVATE_IP}:8002
+AI4BHARAT_TTS_URL=$ttsUrl
 OPENAI_API_KEY=$OPENAI_API_KEY
 XAI_API_KEY=$XAI_API_KEY
 "@
-ok "V2V .env written"
+ok "V2V .env written (TTS: $ttsUrl)"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PHASE 3 — Go Live
@@ -581,7 +683,7 @@ if ($ENABLE_STT -eq "yes" -and -not (Test-Port 8001)) {
 }
 
 # ── TTS ──
-if ($ENABLE_TTS -eq "yes" -and -not (Test-Port 8002)) {
+if ($ENABLE_TTS -eq "local" -and -not (Test-Port 8002)) {
     Start-Service-Window "VoicEra TTS" "$REPO_DIR\ai4bharat_tts_server" `
         ".\venv\Scripts\python.exe server.py"
     ok "TTS started (port 8002)"
@@ -699,10 +801,13 @@ try {
     Write-Host "  API  : ok" -ForegroundColor Cyan
 } catch { Write-Host "  API  : loading..." -ForegroundColor DarkGray }
 
-if (Test-Port 8002) {
-    Write-Host "  TTS  : listening :8002" -ForegroundColor Cyan
-} else {
-    Write-Host "  TTS  : loading..." -ForegroundColor DarkGray
+switch ($ENABLE_TTS) {
+    "local"  {
+        if (Test-Port 8002) { Write-Host "  TTS  : listening :8002" -ForegroundColor Cyan }
+        else { Write-Host "  TTS  : loading..." -ForegroundColor DarkGray }
+    }
+    "remote" { Write-Host "  TTS  : remote ($TTS_REMOTE_URL)" -ForegroundColor Cyan }
+    default  { Write-Host "  TTS  : disabled" -ForegroundColor DarkGray }
 }
 
 Write-Host ""
