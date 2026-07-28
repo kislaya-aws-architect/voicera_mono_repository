@@ -63,7 +63,17 @@
 #Requires -RunAsAdministrator
 
 $ErrorActionPreference = "Stop"
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+# Best-effort only: on AWS Windows Server AMIs this is frequently overridden by a
+# machine/GPO-level execution policy, which makes this call raise a non-terminating
+# error. Under $ErrorActionPreference = "Stop" that becomes fatal and kills the whole
+# script before Phase 1 even starts — confirmed live on a Windows Server 2025 AMI,
+# 2026-07-28. The process-scope Bypass set by the invoking one-liner is what this
+# script actually depends on to run, so a failure here should never be fatal.
+try {
+    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force -ErrorAction Stop
+} catch {
+    Write-Host "  WARN Could not set CurrentUser execution policy (likely blocked by a machine/GPO policy) — continuing with process-level Bypass." -ForegroundColor Yellow
+}
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 $NGROK_TOKEN    = if ($env:NGROK_TOKEN)     { $env:NGROK_TOKEN }     else { "" } # get from https://dashboard.ngrok.com/get-started/your-authtoken
