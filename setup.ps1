@@ -87,9 +87,44 @@
 #      (0x0300), so it won't appear there even with zero driver installed,
 #      unlike the base Amazon console adapter. Falls back to manual
 #      nvidia.com instructions if the automated path fails for any reason
-#      (there are reports of intermittent 404s against this bucket). Either
-#      way, a reboot is required before nvidia-smi will work — this script
-#      cannot reboot itself mid-run, so re-run it after rebooting.
+#      (there are reports of intermittent 404s against this bucket).
+#   9. After a successful automated driver install, the script now prompts
+#      Y/n and actually runs Restart-Computer -Force if confirmed, instead
+#      of only printing a warning and continuing — confirmed live that the
+#      warning-only version does NOT halt anything, silently continuing
+#      Phase 2/3 without GPU acceleration and just hanging on STT instead
+#      of failing cleanly. Driver-bucket file selection is now sorted by
+#      LastModified (not "whatever S3 returns first"), guarding against the
+#      documented case where the bucket briefly holds two files during a
+#      version rollover.
+#  10. Added hydra-core alongside pytorch-lightning to the STT venv install
+#      list (confirmed live ModuleNotFoundError, same --no-deps root cause
+#      as #7). The "fix even on a pre-existing venv" check is now a loop
+#      over a hashtable of required imports instead of one hardcoded check,
+#      so a newly discovered missing package is a one-line addition, not
+#      another full patch round. nemo_toolkit's --no-deps install means its
+#      real dependency list is a manual reconstruction discovered import-
+#      error by import-error — treat this as an ongoing list, not closed.
+#  11. TTS checkpoint download: removed --fuzzy from the gdown --folder call
+#      (confirmed incompatible — --fuzzy is for extracting a file ID from a
+#      single-file sharing URL, not valid combined with --folder, which
+#      already takes a plain folder URL). Both STT and TTS now verify the
+#      checkpoint/file actually exists and is a real size before printing
+#      "ready" — previously both printed unconditional success even when
+#      the download had silently failed.
+#  12. Frontend bypasses "npm run dev" entirely in favor of calling
+#      "npx next dev --webpack" directly, with $env:WATCHPACK_POLLING set
+#      at the PowerShell level first. Root cause: package.json's own dev
+#      script is "WATCHPACK_POLLING=true next dev --webpack --port 3000" —
+#      bash-style inline env-var assignment that cmd.exe (what npm shells
+#      out to on Windows) cannot parse at all. Confirmed live.
+#  13. Every OK/WARN/phase-header line now carries an [HH:mm:ss] timestamp.
+#      Total install duration is printed in the final "VoicEra is Live!"
+#      banner. The start time persists to $env:TEMP\voicera_install_start.txt
+#      across the reboot required by #9, so the duration reflects true
+#      wall-clock time including the reboot gap, not just the final
+#      invocation's own slice of it — cleaned up automatically on genuine
+#      completion so an unrelated future run doesn't inherit a stale marker.
 # =============================================================================
 #Requires -RunAsAdministrator
 
