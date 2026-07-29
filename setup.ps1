@@ -320,7 +320,7 @@ try {
     $driverInstalled = $false
     try {
         $listXml = Invoke-RestMethod "https://ec2-windows-nvidia-drivers.s3.us-east-1.amazonaws.com/?list-type=2&prefix=latest/" -ErrorAction Stop
-        $exeKey = ($listXml.ListBucketResult.Contents | Where-Object { $_.Key -like "*.exe" } | Select-Object -First 1).Key
+        $exeKey = ($listXml.ListBucketResult.Contents | Where-Object { $_.Key -like "*.exe" } | Sort-Object -Property LastModified -Descending | Select-Object -First 1).Key
         if (-not $exeKey) { throw "No .exe found in bucket listing" }
         $driverUrl = "https://ec2-windows-nvidia-drivers.s3.us-east-1.amazonaws.com/$exeKey"
         $driverPath = "$env:TEMP\nvidia_driver.exe"
@@ -334,7 +334,26 @@ try {
     }
 
     if ($driverInstalled) {
-        Write-Host "  WARN NVIDIA driver installed but needs a REBOOT to load. Reboot this instance, then re-run this script — nvidia-smi should work afterward. STT/TTS will not use the GPU until you do." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  ══════════════════════════════════════════════════════" -ForegroundColor Cyan
+        Write-Host "   NVIDIA driver installed — REBOOT REQUIRED before continuing" -ForegroundColor Yellow
+        Write-Host "  ══════════════════════════════════════════════════════" -ForegroundColor Cyan
+        Write-Host "  The driver won't load until this instance reboots. Continuing now would run" -ForegroundColor Yellow
+        Write-Host "  STT/TTS setup without GPU acceleration — confirmed live to just hang instead" -ForegroundColor Yellow
+        Write-Host "  of failing cleanly, wasting the whole run. Stopping here on purpose." -ForegroundColor Yellow
+        Write-Host ""
+        $doReboot = Read-Host "  Reboot now? [Y/n] (your RDP session will drop immediately)"
+        if ($doReboot -ne "n") {
+            Write-Host "  Rebooting..." -ForegroundColor Yellow
+            Restart-Computer -Force
+        } else {
+            Write-Host "  Skipped. Reboot manually before re-running this script — nvidia-smi will not work until you do." -ForegroundColor Yellow
+        }
+        Write-Host ""
+        Write-Host "  After reboot: reconnect via RDP, verify 'nvidia-smi' works, then re-run this" -ForegroundColor White
+        Write-Host "  script — everything up to this point is idempotent and will skip." -ForegroundColor White
+        Write-Host ""
+        exit 0
     } else {
         Write-Host "  WARN Install manually instead: https://www.nvidia.com/Download/Find.aspx -> Data Center/Tesla, T-Series, Tesla T4 (or your instance's actual GPU), your Windows Server version, Any CUDA Toolkit Version. Reboot after installing, then re-run this script." -ForegroundColor Yellow
     }
@@ -463,19 +482,30 @@ if ($ENABLE_STT -eq "yes") {
 
         & "$STT_DIR\venv\Scripts\pip.exe" install -q --upgrade pip 2>&1 | Select-Object -Last 1
         & "$STT_DIR\venv\Scripts\pip.exe" install -q -r requirements.txt 2>&1 | Select-Object -Last 2
-        & "$STT_DIR\venv\Scripts\pip.exe" install -q numba ruamel.yaml scikit-learn tensorboard text-unidecode pytorch-lightning 2>&1 | Select-Object -Last 1
+        & "$STT_DIR\venv\Scripts\pip.exe" install -q numba ruamel.yaml scikit-learn tensorboard text-unidecode pytorch-lightning hydra-core 2>&1 | Select-Object -Last 1
         & "$STT_DIR\venv\Scripts\pip.exe" install -q --no-deps "nemo_toolkit[asr] @ git+https://github.com/AI4Bharat/NeMo.git@nemo-v2" 2>&1 | Select-Object -Last 2
     }
 
     # Runs even when the venv already existed from an earlier run — "skip if venv
     # exists" idempotency means a package added to the install list above never
     # retroactively lands in a venv created before that line existed. Confirmed
-    # live: pytorch-lightning was missing on a box whose STT venv predated this
-    # fix, despite the fix being correctly present in this file.
-    & "$STT_DIR\venv\Scripts\python.exe" -c "import pytorch_lightning" 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "  pytorch_lightning missing from existing STT venv, installing..." -ForegroundColor DarkGray
-        & "$STT_DIR\venv\Scripts\pip.exe" install -q pytorch-lightning 2>&1 | Select-Object -Last 1
+    # live twice: pytorch-lightning, then hydra, both missing on a box whose STT
+    # venv predated each fix, despite the fix being correctly present in this
+    # file. nemo_toolkit is installed --no-deps (see comment above), so its real
+    # dependency list is a manual reconstruction discovered import-error by
+    # import-error — treat this as an ongoing list, not a closed one. To add a
+    # newly discovered missing package, add one entry to the hashtable below.
+    $requiredSttImports = @{
+        "pytorch_lightning" = "pytorch-lightning"
+        "hydra"             = "hydra-core"
+    }
+    foreach ($importName in $requiredSttImports.Keys) {
+        & "$STT_DIR\venv\Scripts\python.exe" -c "import $importName" 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            $pkgName = $requiredSttImports[$importName]
+            Write-Host "  $importName missing from existing STT venv, installing $pkgName..." -ForegroundColor DarkGray
+            & "$STT_DIR\venv\Scripts\pip.exe" install -q $pkgName 2>&1 | Select-Object -Last 1
+        }
     }
 
     # Download STT checkpoint
