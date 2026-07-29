@@ -122,10 +122,10 @@ $VOICERA_REPO_URL    = if ($env:VOICERA_REPO_URL)    { $env:VOICERA_REPO_URL }  
 $VOICERA_REPO_BRANCH = if ($env:VOICERA_REPO_BRANCH) { $env:VOICERA_REPO_BRANCH } else { "dev" }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-function log  { param($m) Write-Host "`n[VoicEra] $m" -ForegroundColor Green }
-function ok   { param($m) Write-Host "  OK  $m" -ForegroundColor Cyan }
-function warn { param($m) Write-Host "  WARN $m" -ForegroundColor Yellow }
-function err  { param($m) Write-Host "[ERROR] $m" -ForegroundColor Red; exit 1 }
+function log  { param($m) Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] [VoicEra] $m" -ForegroundColor Green }
+function ok   { param($m) Write-Host "  [$(Get-Date -Format 'HH:mm:ss')] OK  $m" -ForegroundColor Cyan }
+function warn { param($m) Write-Host "  [$(Get-Date -Format 'HH:mm:ss')] WARN $m" -ForegroundColor Yellow }
+function err  { param($m) Write-Host "[$(Get-Date -Format 'HH:mm:ss')] [ERROR] $m" -ForegroundColor Red; exit 1 }
 
 function Refresh-Path {
     $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" +
@@ -169,6 +169,33 @@ function Show-Banner {
 
 Show-Banner
 
+# Persisted across a reboot (see the driver-install exit path below) so total
+# install time reflects true wall-clock time, not just this invocation's slice
+# of it. $env:TEMP survives a normal Windows reboot (it's not auto-cleared),
+# and resolves to the same path across RDP reconnects as the same user.
+$startTimeMarkerFile = "$env:TEMP\voicera_install_start.txt"
+$scriptStartTime = $null
+if (Test-Path $startTimeMarkerFile) {
+    try {
+        $markerTime = Get-Date (Get-Content $startTimeMarkerFile -Raw).Trim()
+        # Guard against a stale marker from an old, unrelated run (e.g. the
+        # script failed for a different reason days ago and never cleaned up) —
+        # a genuine driver-install reboot-and-resume gap should be minutes, not
+        # hours. Anything older than 2 hours is treated as stale, not resumed.
+        if (((Get-Date) - $markerTime).TotalHours -lt 2) {
+            $scriptStartTime = $markerTime
+            Write-Host "  Resuming an earlier run (originally started $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss')), likely after a driver-install reboot)" -ForegroundColor DarkGray
+        }
+    } catch {
+        # Corrupted or unparsable marker — fall through and start fresh below
+    }
+}
+if (-not $scriptStartTime) {
+    $scriptStartTime = Get-Date
+    Set-Content -Path $startTimeMarkerFile -Value $scriptStartTime.ToString('o')
+}
+Write-Host "  Run started: $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor DarkGray
+Write-Host ""
 # ── Pre-flight: winget must actually work before Phase 1 needs it ────────────
 if (-not (Test-WingetAvailable)) {
     err @"
@@ -352,6 +379,8 @@ try {
         Write-Host ""
         Write-Host "  After reboot: reconnect via RDP, verify 'nvidia-smi' works, then re-run this" -ForegroundColor White
         Write-Host "  script — everything up to this point is idempotent and will skip." -ForegroundColor White
+        $elapsedSoFar = (Get-Date) - $scriptStartTime
+        Write-Host "  Time elapsed this run: $($elapsedSoFar.ToString('hh\:mm\:ss'))" -ForegroundColor DarkGray
         Write-Host ""
         exit 0
     } else {
@@ -825,10 +854,13 @@ for ($i = 1; $i -le 18; $i++) {
 }
 
 # ── Final summary ──
+$totalElapsed = (Get-Date) - $scriptStartTime
+Remove-Item $startTimeMarkerFile -Force -ErrorAction SilentlyContinue
 Write-Host ""
 Write-Host "  ══════════════════════════════════════════════════════" -ForegroundColor Cyan
 Write-Host "            VoicEra is Live!" -ForegroundColor Green
 Write-Host "  ══════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "  Install time: $($totalElapsed.ToString('hh\:mm\:ss'))  (started $($scriptStartTime.ToString('HH:mm:ss')), finished $((Get-Date).ToString('HH:mm:ss')))" -ForegroundColor DarkGray
 
 if ($NGROK_URL)  { Write-Host "  V2V (ngrok):      $NGROK_URL" -ForegroundColor White }
 if ($CF_URL)     { Write-Host "  App (Cloudflare): $CF_URL"    -ForegroundColor White }
