@@ -21,7 +21,7 @@
 #   $env:OPENAI_API_KEY
 #   $env:XAI_API_KEY
 #   $env:VOICERA_REPO_URL      which app repo to clone (default: COSS-India org repo)
-#   $env:VOICERA_REPO_BRANCH   which branch to clone (default: dev)
+#   $env:VOICERA_REPO_BRANCH   which branch to clone (default: main)
 #
 # -----------------------------------------------------------------------------
 # CHANGES FROM UPSTREAM (kislaya-aws-architect fork, forked from
@@ -54,9 +54,9 @@
 #      https://github.com/microsoft/winget-cli/issues/5207. Failing loudly
 #      here avoids a confusing cascade of package-install failures.
 #   5. Repo clone target is now configurable via $env:VOICERA_REPO_URL /
-#      $env:VOICERA_REPO_BRANCH. Defaults preserve upstream behavior
-#      (COSS-India org repo, dev branch) — override these if you want this
-#      box deploying your own fork/branch instead.
+#      $env:VOICERA_REPO_BRANCH. Default changed from upstream's dev branch
+#      to main (COSS-India org repo, main branch) — override these if you
+#      want this box deploying your own fork/branch instead.
 #   6. Vobiz block left functionally unchanged but flagged: Vobiz is being
 #      decommissioned org-wide in favor of Vodafone Vi Business Managed SIP.
 #      Treat these fields as a placeholder pending that cutover.
@@ -154,7 +154,7 @@ $OPENAI_API_KEY = if ($env:OPENAI_API_KEY)  { $env:OPENAI_API_KEY }  else { "" }
 $XAI_API_KEY    = if ($env:XAI_API_KEY)     { $env:XAI_API_KEY }     else { "" }
 $REPO_DIR       = "C:\VoicEra"
 $VOICERA_REPO_URL    = if ($env:VOICERA_REPO_URL)    { $env:VOICERA_REPO_URL }    else { "https://github.com/COSS-India/voicera_mono_repository.git" }
-$VOICERA_REPO_BRANCH = if ($env:VOICERA_REPO_BRANCH) { $env:VOICERA_REPO_BRANCH } else { "dev" }
+$VOICERA_REPO_BRANCH = if ($env:VOICERA_REPO_BRANCH) { $env:VOICERA_REPO_BRANCH } else { "main" }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 function log  { param($m) Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] [VoicEra] $m" -ForegroundColor Green }
