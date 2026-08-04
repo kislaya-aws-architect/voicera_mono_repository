@@ -577,32 +577,39 @@ if ($ENABLE_STT -eq "yes") {
 
         & "$STT_DIR\venv\Scripts\pip.exe" install -q --upgrade pip 2>&1 | Select-Object -Last 1
         & "$STT_DIR\venv\Scripts\pip.exe" install -q -r requirements.txt 2>&1 | Select-Object -Last 2
-        & "$STT_DIR\venv\Scripts\pip.exe" install -q numba ruamel.yaml scikit-learn tensorboard text-unidecode pytorch-lightning hydra-core wrapt 2>&1 | Select-Object -Last 1
         & "$STT_DIR\venv\Scripts\pip.exe" install -q --no-deps "nemo_toolkit[asr] @ git+https://github.com/AI4Bharat/NeMo.git@nemo-v2" 2>&1 | Select-Object -Last 2
     }
 
-    # Runs even when the venv already existed from an earlier run — "skip if venv
-    # exists" idempotency means a package added to the install list above never
-    # retroactively lands in a venv created before that line existed. Confirmed
-    # live twice: pytorch-lightning, then hydra, both missing on a box whose STT
-    # venv predated each fix, despite the fix being correctly present in this
-    # file. nemo_toolkit is installed --no-deps (see comment above), so its real
-    # dependency list is a manual reconstruction discovered import-error by
-    # import-error — treat this as an ongoing list, not a closed one. To add a
-    # newly discovered missing package, add one entry to the hashtable below.
-    $requiredSttImports = @{
-        "pytorch_lightning" = "pytorch-lightning"
-        "hydra"             = "hydra-core"
-        "wrapt"             = "wrapt"
-    }
-    foreach ($importName in $requiredSttImports.Keys) {
-        & "$STT_DIR\venv\Scripts\python.exe" -c "import $importName" 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            $pkgName = $requiredSttImports[$importName]
-            Write-Host "  $importName missing from existing STT venv, installing $pkgName..." -ForegroundColor DarkGray
-            & "$STT_DIR\venv\Scripts\pip.exe" install -q $pkgName 2>&1 | Select-Object -Last 1
-        }
-    }
+    # nemo_toolkit is installed --no-deps above (avoids its unconstrained "torch"
+    # entry silently overwriting the CUDA-matched build already installed via
+    # this venv's own requirements.txt). Its real dependency list — fetched
+    # directly from AI4Bharat/NeMo's requirements/*.txt on the nemo-v2 branch
+    # (requirements.txt + requirements_asr.txt + requirements_lightning.txt +
+    # requirements_common.txt, matching setup.py's extras_require['asr']
+    # composition exactly) — is installed explicitly here instead, every run,
+    # not just on fresh venv creation. This replaces four rounds of one-at-a-
+    # time whack-a-mole (pytorch_lightning, hydra, wrapt, dateutil, each
+    # discovered only by crashing) with the complete known set installed at
+    # once. Unconditional and idempotent — pip is fast when a package is
+    # already satisfied, so this costs nothing on a venv that's already
+    # correct, and fixes one that predates this list the same way it handles
+    # a fresh one. torch and triton deliberately excluded: torch for the
+    # reason above, triton for weak/inconsistent Windows support and because
+    # it isn't on this server's actual code path.
+    $nemoDeps = @(
+        "huggingface_hub==0.23.2", "numba", "numpy>=1.22", "onnx>=1.7.0", "python-dateutil",
+        "ruamel.yaml", "scikit-learn", "setuptools>=65.5.1", "tensorboard", "text-unidecode",
+        "tqdm>=4.41.0", "wget", "wrapt",
+        "braceexpand", "editdistance", "g2p_en", "ipywidgets", "jiwer", "kaldi-python-io",
+        "kaldiio", "lhotse>=1.20.0", "librosa>=0.10.0", "marshmallow", "matplotlib", "packaging",
+        "pyannote.core", "pyannote.metrics", "pydub", "pyloudnorm", "resampy", "scipy>=0.14",
+        "soundfile", "sox", "texterrors",
+        "hydra-core>1.3,<=1.3.2", "omegaconf<=2.3", "pytorch-lightning>=2.2.1",
+        "torchmetrics>=0.11.0", "transformers>=4.36.0", "wandb", "webdataset>=0.2.86",
+        "datasets", "inflect", "pandas", "sacremoses>=0.0.43", "sentencepiece<1.0.0"
+    )
+    Write-Host "  Ensuring full NeMo ASR dependency set is installed..." -ForegroundColor DarkGray
+    & "$STT_DIR\venv\Scripts\pip.exe" install -q $nemoDeps 2>&1 | Select-Object -Last 3
 
     # Download STT checkpoint
     New-Item -ItemType Directory -Force -Path "$STT_DIR\checkpoints" | Out-Null
