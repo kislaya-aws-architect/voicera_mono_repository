@@ -502,21 +502,52 @@ if (-not (Get-Command mongosh -ErrorAction SilentlyContinue)) {
 New-Item -ItemType Directory -Force -Path "C:\data\mongodb9" | Out-Null
 New-Item -ItemType Directory -Force -Path "C:\logs\mongodb" | Out-Null
 
-# Start MongoDB
+# Start MongoDB (no --auth yet, so the first user can be bootstrapped)
 if (-not (Test-Port 27017)) {
     Start-Process mongod -ArgumentList "--dbpath C:\data\mongodb9 --logpath C:\logs\mongodb\mongod.log --port 27017" -WindowStyle Hidden
+    # Poll for the port instead of a fixed sleep — a fixed 4s wait is not always
+    # enough on a data directory's first-ever start, especially with several
+    # other services launching around the same time. Confirmed live: this
+    # produced a silently-failed admin user creation below, which only
+    # surfaced ~30 minutes later as an opaque MongoDB auth failure in the
+    # Backend window, after the rest of Phase 2 had already completed.
+    $mongoReady = $false
+    for ($i = 0; $i -lt 20; $i++) {
+        if (Test-Port 27017) { $mongoReady = $true; break }
+        Start-Sleep -Seconds 1
+    }
+    if (-not $mongoReady) {
+        err "MongoDB did not start listening on port 27017 within 20 seconds. Check C:\logs\mongodb\mongod.log for the actual error before re-running."
+    }
+
+    # Create admin user — verified, not silently swallowed. Deliberately inside
+    # this "port wasn't already listening" branch: on a re-run where mongod is
+    # already up with --auth from an earlier successful pass in the same
+    # session, this unauthenticated call would legitimately fail (not
+    # authorized) even though the system is already correctly set up — running
+    # it only on a genuinely fresh, not-yet-authenticated start avoids that
+    # false alarm.
+    $createUserOutput = mongosh admin --quiet --eval "db.createUser({user:'admin',pwd:'admin123',roles:[{role:'root',db:'admin'}]})" 2>&1
+    $userCheck = mongosh admin --quiet --eval "db.getUser('admin') !== null" 2>&1
+    if ($userCheck -notmatch "true") {
+        err @"
+Failed to create the MongoDB admin user. mongosh output:
+$createUserOutput
+
+Check C:\logs\mongodb\mongod.log for the underlying error, then re-run this
+script. If the data directory is in a bad state from a prior partial run:
+  Stop-Process -Name mongod -ErrorAction SilentlyContinue
+  Remove-Item C:\data\mongodb9\* -Recurse -Force
+then re-run.
+"@
+    }
+    ok "MongoDB admin user confirmed"
+
+    # Restart with --auth
+    Stop-Process -Name mongod -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2
+    Start-Process mongod -ArgumentList "--dbpath C:\data\mongodb9 --logpath C:\logs\mongodb\mongod.log --port 27017 --auth" -WindowStyle Hidden
     Start-Sleep -Seconds 4
 }
-
-# Create admin user (ignore error if already exists)
-try {
-    mongosh admin --eval "db.createUser({user:'admin',pwd:'admin123',roles:[{role:'root',db:'admin'}]})" 2>$null | Out-Null
-} catch {}
-
-# Restart with --auth
-Stop-Process -Name mongod -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2
-Start-Process mongod -ArgumentList "--dbpath C:\data\mongodb9 --logpath C:\logs\mongodb\mongod.log --port 27017 --auth" -WindowStyle Hidden
-Start-Sleep -Seconds 4
 ok "MongoDB ready"
 
 # ── MinIO ──
@@ -546,7 +577,7 @@ if ($ENABLE_STT -eq "yes") {
 
         & "$STT_DIR\venv\Scripts\pip.exe" install -q --upgrade pip 2>&1 | Select-Object -Last 1
         & "$STT_DIR\venv\Scripts\pip.exe" install -q -r requirements.txt 2>&1 | Select-Object -Last 2
-        & "$STT_DIR\venv\Scripts\pip.exe" install -q numba ruamel.yaml scikit-learn tensorboard text-unidecode pytorch-lightning hydra-core 2>&1 | Select-Object -Last 1
+        & "$STT_DIR\venv\Scripts\pip.exe" install -q numba ruamel.yaml scikit-learn tensorboard text-unidecode pytorch-lightning hydra-core wrapt 2>&1 | Select-Object -Last 1
         & "$STT_DIR\venv\Scripts\pip.exe" install -q --no-deps "nemo_toolkit[asr] @ git+https://github.com/AI4Bharat/NeMo.git@nemo-v2" 2>&1 | Select-Object -Last 2
     }
 
@@ -562,6 +593,7 @@ if ($ENABLE_STT -eq "yes") {
     $requiredSttImports = @{
         "pytorch_lightning" = "pytorch-lightning"
         "hydra"             = "hydra-core"
+        "wrapt"             = "wrapt"
     }
     foreach ($importName in $requiredSttImports.Keys) {
         & "$STT_DIR\venv\Scripts\python.exe" -c "import $importName" 2>$null
@@ -801,9 +833,17 @@ if ($ENABLE_TTS -eq "local" -and -not (Test-Port 8002)) {
 # branch to keep it that way.
 
 # ── Voice2Voice ──
+# NOTE: NLTK's import-security finder (nltk/inisec.py, added 2026) blocks any
+# import it sees resolving to somewhere inside the current working directory,
+# to guard against a malicious file shadowing a real package. It doesn't
+# special-case a venv living inside the project directory it's launched from —
+# which is exactly this script's layout — so the *legitimate* regex package
+# under venv\lib\site-packages gets misidentified as a CWD-planted file and
+# blocked. Confirmed live via the actual nltk/inisec.py source. Disabling via
+# the env var NLTK itself documents for this purpose, not a workaround hack.
 if (-not (Test-Port 7860)) {
     Start-Service-Window "VoicEra V2V" $V2V_DIR `
-        "$V2V_DIR\venv\Scripts\python.exe main.py"
+        "`$env:NLTK_DISABLE_IMPORT_SECURITY='1'; $V2V_DIR\venv\Scripts\python.exe main.py"
     Start-Sleep -Seconds 5
 }
 ok "V2V started (port 7860)"
