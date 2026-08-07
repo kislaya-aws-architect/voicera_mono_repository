@@ -38,6 +38,15 @@ QUANTIZATION = "fp8"
 HOST = "0.0.0.0"
 PORT = 8003
 
+# ── API KEY (hardening/phase-0-critical-fixes, SEC-06) ────────
+# This server is an OpenAI-compatible endpoint that runs real, billable GPU
+# inference. Previously it was launched with --host 0.0.0.0 and NO API key,
+# so any network-reachable client could consume GPU inference for free.
+# Set LLM_SERVER_API_KEY in the environment before starting this launcher;
+# vLLM will then require `Authorization: Bearer <key>` on every request.
+# Generate one with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+LLM_SERVER_API_KEY_ENV_VAR = "LLM_SERVER_API_KEY"
+
 # ── CONTEXT / SEQUENCE LENGTH ────────────────────────────────
 # Maximum number of tokens (prompt + response) per request
 # Lower = less VRAM for KV cache, faster, good for telephony
@@ -191,10 +200,49 @@ def build_command():
         # This default is handled at request time in your client code
         pass
 
+    api_key = os.environ.get(LLM_SERVER_API_KEY_ENV_VAR)
+    if api_key:
+        cmd += ["--api-key", api_key]
+
     return cmd
 
 
+def _check_auth_before_launch():
+    """
+    SEC-06 (hardening/phase-0-critical-fixes): refuse to launch an
+    unauthenticated, network-reachable GPU inference endpoint by default.
+    Set LLM_SERVER_API_KEY to require `Authorization: Bearer <key>` on every
+    request, or explicitly set LLM_SERVER_ALLOW_NO_AUTH=true if you have
+    your own network-level control (e.g. HOST=127.0.0.1, or a firewalled/
+    VPC-only deployment) and genuinely want to run without one.
+    """
+    api_key = os.environ.get(LLM_SERVER_API_KEY_ENV_VAR)
+    allow_no_auth = os.environ.get("LLM_SERVER_ALLOW_NO_AUTH", "false").strip().lower() == "true"
+
+    if api_key:
+        return
+
+    if HOST != "127.0.0.1" and not allow_no_auth:
+        print(
+            f"\nERROR: {LLM_SERVER_API_KEY_ENV_VAR} is not set and HOST is '{HOST}' "
+            "(network-reachable). Refusing to launch an unauthenticated GPU "
+            "inference endpoint.\n\n"
+            f"  Fix: export {LLM_SERVER_API_KEY_ENV_VAR}=$(python -c \"import secrets; print(secrets.token_urlsafe(32))\")\n"
+            "  Or, if you have your own network-level access control and\n"
+            "  genuinely want no auth: export LLM_SERVER_ALLOW_NO_AUTH=true\n"
+        )
+        sys.exit(1)
+
+    if allow_no_auth:
+        print(
+            "\nWARNING: LLM_SERVER_ALLOW_NO_AUTH=true - launching WITHOUT an API key. "
+            "Make sure this endpoint is not reachable from outside your trust boundary.\n"
+        )
+
+
 def main():
+    _check_auth_before_launch()
+
     env = os.environ.copy()
 
     env["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
@@ -214,6 +262,7 @@ def main():
     print(f"  Reasoning Mode : {REASONING_PARSER or 'Raw (no parser)'}")
     print(f"  Thinking Mode  : {'ON' if ENABLE_THINKING_DEFAULT else 'OFF (use /no_think in system prompt)'}")
     print(f"  Host:Port      : {HOST}:{PORT}")
+    print(f"  API Key        : {'set (required on every request)' if os.environ.get(LLM_SERVER_API_KEY_ENV_VAR) else 'NOT SET - unauthenticated (LLM_SERVER_ALLOW_NO_AUTH=true)'}")
     print(f"  Chunked Prefill: {ENABLE_CHUNKED_PREFILL}")
     print(f"  Max Sequences  : {MAX_NUM_SEQS}")
     print(f"  GPU Mem Util   : {GPU_MEMORY_UTILIZATION}")

@@ -23,8 +23,12 @@ from pipecat.services.openai.llm import OpenAILLMService
 # set VLLM_BASE_URL in the environment to override without code changes.
 VLLM_BASE_URL = "http://100.64.1.16:8003/v1"
 
-# vLLM does not validate keys; a placeholder satisfies the OpenAI client.
-VLLM_API_KEY = "EMPTY"
+# vLLM does not validate keys unless launched with --api-key (see
+# llm_server/server.py, SEC-06 in hardening/phase-0-critical-fixes). This
+# now reads the same key the server was started with; "EMPTY" remains the
+# fallback for anyone still intentionally running vLLM without auth
+# (LLM_SERVER_ALLOW_NO_AUTH=true), which vLLM accepts as a no-op.
+VLLM_API_KEY = os.environ.get("LLM_SERVER_API_KEY", "EMPTY")
 
 # Must match the served model id on vLLM (e.g. Qwen/Qwen3-8B).
 VLLM_MODEL = "Qwen/Qwen3-8B"
