@@ -4,6 +4,11 @@ fastapi[all]==0.121.3
 uvicorn==0.40.0
 pydantic==2.12.0
 
+# Security (hardening/phase-0-critical-fixes): per-IP rate limiting stopgap
+# on the endpoints that directly cost money (outbound calling, answer
+# webhooks) - see COST-01 in the Phase 1 deep analysis.
+slowapi==0.1.9
+
 # Pipecat AI with all required service extras
 pipecat-ai[silero,websocket,google,cartesia,openai,deepgram,sarvam,elevenlabs,anthropic,grok]==0.0.98
 

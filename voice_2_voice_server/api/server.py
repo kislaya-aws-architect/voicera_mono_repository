@@ -11,11 +11,14 @@ from typing import Optional, Dict, Any
 
 from loguru import logger
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, Request, HTTPException
+from fastapi import FastAPI, WebSocket, Request, HTTPException, Depends
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from .bot import bot
 from utils.telemetry import router as telemetry_router
@@ -26,6 +29,15 @@ from utils.backend_utils import (
     fetch_integration_key,
 )
 from utils.batching import create_batch_router
+from utils.security import (
+    require_internal_api_key,
+    mint_agent_session_token,
+    authorize_agent_websocket,
+    authorize_browser_websocket,
+    verify_plivo_signature,
+    verify_vobiz_signature,
+    webhook_verification_enabled,
+)
 
 
 load_dotenv()
@@ -279,15 +291,95 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+# SEC-08 (hardening/phase-0-critical-fixes): no wildcard-origin fallback -
+# see voicera_backend/app/main.py for the identical fix and rationale.
+_allowed_origins_raw = os.environ.get("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_raw.split(",") if o.strip()]
+if not ALLOWED_ORIGINS:
+    logger.warning(
+        "ALLOWED_ORIGINS is not set - CORS will reject all cross-origin "
+        "browser requests. Set ALLOWED_ORIGINS in voice_2_voice_server/.env."
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 app.include_router(telemetry_router)
 app.include_router(create_batch_router(make_outbound_call_provider))
+
+
+# COST-01 (hardening/phase-0-critical-fixes) stopgap rate limiting.
+#
+# This is a per-IP limit at the application layer - a real deployment
+# behind nginx/a CDN should also rate-limit at the edge (Phase 2), and
+# per-IP limiting is imperfect for calls arriving via a shared telephony
+# provider IP range. It is still a meaningful backstop against a runaway
+# retry loop or casual abuse hitting the two endpoints that directly cost
+# money: outbound calling and the answer webhooks that stand up a full
+# STT/LLM/TTS session.
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+OUTBOUND_CALL_RATE_LIMIT = os.environ.get("OUTBOUND_CALL_RATE_LIMIT", "20/minute")
+ANSWER_WEBHOOK_RATE_LIMIT = os.environ.get("ANSWER_WEBHOOK_RATE_LIMIT", "60/minute")
+
+
+# === Webhook signature verification helper (SEC-03) ===
+#
+# NOTE (Phase 1 follow-up, REL-01): this performs its own
+# fetch_agent_config_from_backend() call, which - like every other backend
+# call in this file - is currently synchronous I/O inside an async
+# coroutine. It is not made worse by this change (the same call already
+# happens in log_meeting()), but the two should be consolidated into one
+# fetch once the async-HTTP-client migration lands.
+async def _verify_provider_webhook(request: Request, agent_id: Optional[str], provider: str) -> bool:
+    """
+    Verify that an inbound answer/hangup webhook genuinely came from the
+    configured telephony provider for this agent's organization. Returns
+    True if the request should proceed.
+
+    Behavior is deliberately asymmetric:
+      - Signature present but WRONG  -> always reject (this is a forged
+        or tampered request; there is no safe fallback).
+      - No signing credential configured for this org yet -> log a loud
+        warning and allow the request through, so orgs that haven't
+        finished configuring telephony credentials aren't silently locked
+        out of receiving calls. Configure VobizAuthToken/PlivoAuthToken in
+        Integrations to close this gap for a given org.
+    """
+    env_var = "VOBIZ_WEBHOOK_VERIFICATION" if provider == "vobiz" else "PLIVO_WEBHOOK_VERIFICATION"
+    if not webhook_verification_enabled(env_var):
+        return True
+
+    if not agent_id:
+        return True  # existing handlers already 404/no-op on a missing agent_id
+
+    agent_config = await fetch_agent_config_from_backend(agent_id)
+    if not agent_config:
+        return True  # existing handlers already handle "agent not found"
+
+    org_id = agent_config.get("org_id")
+    if not org_id:
+        return True
+
+    key_name = "VobizAuthToken" if provider == "vobiz" else "PlivoAuthToken"
+    auth_token = fetch_integration_key(org_id, key_name)
+    if not auth_token:
+        logger.warning(
+            f"⚠️  No {key_name} configured for org={org_id} - cannot verify {provider} "
+            f"webhook signature for agent={agent_id}. Allowing request through; "
+            f"configure {key_name} in Integrations to close this gap."
+        )
+        return True
+
+    full_url = str(request.url)
+    verify_fn = verify_vobiz_signature if provider == "vobiz" else verify_plivo_signature
+    return verify_fn(request, full_url, auth_token)
 
 
 # === Routes ===
@@ -304,30 +396,44 @@ async def health():
     return {"status": "healthy"}
 
 
-@app.post("/outbound/call/")
-async def make_outbound_call(request: OutboundCallRequest):
+@app.post("/outbound/call/", dependencies=[Depends(require_internal_api_key)])
+@limiter.limit(OUTBOUND_CALL_RATE_LIMIT)
+async def make_outbound_call(request: Request, payload: OutboundCallRequest):
     """Initiate an outbound call.
 
+    SEC-02 (hardening/phase-0-critical-fixes): this endpoint dials out using
+    the organization's live telephony credentials and previously had no
+    authentication at all - anyone who could reach this port could place
+    calls (and run up the bill) at will. It now requires the X-API-Key
+    header (INTERNAL_API_KEY), the same convention already used for
+    service-to-service calls to voicera_backend, plus a per-IP rate limit
+    (COST-01 stopgap - see OUTBOUND_CALL_RATE_LIMIT).
+
+    Note: the parameter was renamed from `request` to `payload` (and an
+    explicit `request: Request` added) because slowapi's rate limiter needs
+    a real Starlette Request object to key on, and the name `request` was
+    already taken by the Pydantic body model.
+
     Args:
-        request: Outbound call parameters
+        payload: Outbound call parameters
 
     Returns:
         Call initiation result
     """
     try:
         result = await make_outbound_call_provider(
-            request.customer_number,
-            request.agent_id,
-            request.caller_id,
+            payload.customer_number,
+            payload.agent_id,
+            payload.caller_id,
         )
         return JSONResponse(
             status_code=200,
             content={
                 "status": "success",
                 "message": "Outbound call initiated",
-                "customer_number": request.customer_number,
-                "agent_id": request.agent_id,
-                "caller_id": request.caller_id,
+                "customer_number": payload.customer_number,
+                "agent_id": payload.agent_id,
+                "caller_id": payload.caller_id,
                 "result": result,
             },
         )
@@ -376,6 +482,7 @@ async def log_meeting(agent_id: str, form_data_dict: dict):
 
 
 @app.api_route("/answer", methods=["GET", "POST"])
+@limiter.limit(ANSWER_WEBHOOK_RATE_LIMIT)
 async def vobiz_answer_webhook(request: Request):
     """Vobiz answer webhook - returns XML with WebSocket URL.
 
@@ -383,6 +490,14 @@ async def vobiz_answer_webhook(request: Request):
     It returns XML instructing Vobiz to connect to our WebSocket.
     """
     agent_id = request.query_params.get("agent_id")
+
+    # SEC-03: reject webhooks that don't verify as genuinely from Vobiz
+    # (see _verify_provider_webhook for the fail-open exception when no
+    # signing credential is configured yet for this org).
+    if not await _verify_provider_webhook(request, agent_id, "vobiz"):
+        logger.warning(f"🚫 Rejected /answer webhook for agent={agent_id}: signature verification failed")
+        raise HTTPException(status_code=401, detail="Webhook signature verification failed")
+
     form_data = await request.form()
     form_data_dict = dict(form_data)
     event = form_data_dict.get("Event", "unknown")
@@ -391,7 +506,12 @@ async def vobiz_answer_webhook(request: Request):
     if event == "StartApp":
         await log_meeting(agent_id, form_data_dict)
         websocket_prefix = os.environ.get("JOHNAIC_WEBSOCKET_URL", "")
-        websocket_url = f"{websocket_prefix}/agent/{agent_id}"
+        # SEC-01: embed a short-lived signed session token so the WebSocket
+        # endpoint below can verify this connection was actually issued by
+        # us, rather than accepting any connection that knows/guesses an
+        # agent_id.
+        session_token = mint_agent_session_token(agent_id, "vobiz")
+        websocket_url = f"{websocket_prefix}/agent/{agent_id}?token={session_token}"
         return Response(
             content=_build_stream_xml(websocket_url),
             media_type="application/xml",
@@ -411,6 +531,12 @@ async def websocket_endpoint(websocket: WebSocket, agent_id: str):
         websocket: WebSocket connection
         agent_id: Agent ID to use
     """
+    # SEC-01: verify the signed session token BEFORE accepting the
+    # connection. authorize_agent_websocket() closes the connection itself
+    # on failure and returns False - it is safe to call before accept().
+    if not await authorize_agent_websocket(websocket, agent_id, "vobiz"):
+        return
+
     await websocket.accept()
     logger.info(f"🔌 WebSocket connected: agent={agent_id}")
 
@@ -462,15 +588,22 @@ async def websocket_endpoint(websocket: WebSocket, agent_id: str):
 
 
 @app.api_route("/plivo/answer", methods=["GET", "POST"])
+@limiter.limit(ANSWER_WEBHOOK_RATE_LIMIT)
 async def plivo_answer_webhook(request: Request):
     """Plivo answer webhook - returns XML with WebSocket URL."""
     agent_id = request.query_params.get("agent_id")
+
+    if not await _verify_provider_webhook(request, agent_id, "plivo"):
+        logger.warning(f"🚫 Rejected /plivo/answer webhook for agent={agent_id}: signature verification failed")
+        raise HTTPException(status_code=401, detail="Webhook signature verification failed")
+
     form_data = await request.form()
     form_data_dict = dict(form_data)
     await log_meeting(agent_id, form_data_dict)
 
     websocket_prefix = os.environ.get("JOHNAIC_WEBSOCKET_URL", "")
-    websocket_url = f"{websocket_prefix}/plivo/agent/{agent_id}"
+    session_token = mint_agent_session_token(agent_id, "plivo")
+    websocket_url = f"{websocket_prefix}/plivo/agent/{agent_id}?token={session_token}"
     return Response(
         content=_build_stream_xml(websocket_url),
         media_type="application/xml",
@@ -481,6 +614,11 @@ async def plivo_answer_webhook(request: Request):
 async def plivo_hangup_webhook(request: Request):
     """Plivo hangup callback for provider-native call completion events."""
     agent_id = request.query_params.get("agent_id")
+
+    if not await _verify_provider_webhook(request, agent_id, "plivo"):
+        logger.warning(f"🚫 Rejected /plivo/hangup webhook for agent={agent_id}: signature verification failed")
+        raise HTTPException(status_code=401, detail="Webhook signature verification failed")
+
     form_data = await request.form()
     form_data_dict = dict(form_data)
     await log_meeting(agent_id, form_data_dict)
@@ -490,6 +628,12 @@ async def plivo_hangup_webhook(request: Request):
 @app.websocket("/plivo/agent/{agent_id}")
 async def plivo_websocket_endpoint(websocket: WebSocket, agent_id: str):
     """WebSocket endpoint for Plivo audio streaming."""
+    # SEC-01: verify the signed session token before doing any work. This
+    # connection has not been accept()-ed yet (bot() accepts internally for
+    # the Plivo transport), and closing an unaccepted WebSocket is safe.
+    if not await authorize_agent_websocket(websocket, agent_id, "plivo"):
+        return
+
     logger.info(f"🔌 Plivo WebSocket connected: agent={agent_id}")
 
     call_sid = None
@@ -521,6 +665,15 @@ async def plivo_websocket_endpoint(websocket: WebSocket, agent_id: str):
 @app.websocket("/browser/agent/{agent_id}")
 async def browser_websocket_endpoint(websocket: WebSocket, agent_id: str):
     """WebSocket endpoint for browser testing with live transcript events."""
+    # SEC-01: this is a dev/test entrypoint with no telephony webhook to
+    # mint a session token from, so it is gated directly behind
+    # INTERNAL_API_KEY (passed as ?token=... since browsers can't set
+    # custom headers on a WebSocket handshake) and can be disabled outright
+    # via ENABLE_BROWSER_TEST_ENDPOINT=false. Previously this endpoint had
+    # no authentication at all.
+    if not await authorize_browser_websocket(websocket):
+        return
+
     await websocket.accept()
     logger.info(f"🔌 Browser WebSocket connected: agent={agent_id}")
 
