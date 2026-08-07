@@ -18,12 +18,18 @@ logger = logging.getLogger(__name__)
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
 
 # JWT settings
-# SECRET_KEY should be set in .env file for production
+#
+# SECRET_KEY is REQUIRED and is read from app.config.settings, which is the
+# single source of truth (previously this module and app/config.py each had
+# their own independent fallback, and this module would silently generate a
+# random per-process key if SECRET_KEY was unset - see hardening/phase-0
+# SEC-04/SEC-13/REL-05). A random per-process key means every replica or
+# restart signs with a different key and rejects tokens issued by any other
+# instance, which silently breaks horizontal scaling and is unsafe to run
+# in anything but a single, never-restarted process.
+#
 # Generate a secure key: python -c "import secrets; print(secrets.token_urlsafe(32))"
-SECRET_KEY = os.getenv("SECRET_KEY")
-if not SECRET_KEY:
-    logger.warning("SECRET_KEY not set in environment. Generating a temporary key. Set SECRET_KEY in .env for production!")
-    SECRET_KEY = secrets.token_urlsafe(32)
+SECRET_KEY = settings.SECRET_KEY
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
@@ -196,7 +202,9 @@ async def verify_api_key(
             detail="Missing API key"
         )
     
-    if x_api_key != INTERNAL_API_KEY:
+    # Constant-time comparison - a plain `!=` here is a timing side-channel
+    # against a secret that every internal service shares (SEC-12).
+    if not secrets.compare_digest(x_api_key, INTERNAL_API_KEY):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key"

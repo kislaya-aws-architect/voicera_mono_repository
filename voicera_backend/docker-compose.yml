@@ -1,15 +1,19 @@
 version: '3.8'
 
+# SECURITY NOTE (hardening/phase-0-critical-fixes): credentials are now
+# required from .env - no insecure defaults - and the DB port is bound to
+# 127.0.0.1 only. See voicera_backend/env.example.
+
 services:
   mongodb:
     image: mongo:latest
     container_name: voicera_mongodb
     restart: unless-stopped
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     environment:
-      MONGO_INITDB_ROOT_USERNAME: admin
-      MONGO_INITDB_ROOT_PASSWORD: admin123
+      MONGO_INITDB_ROOT_USERNAME: ${MONGODB_USER:?Set MONGODB_USER in .env}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGODB_PASSWORD:?Set MONGODB_PASSWORD in .env}
       MONGO_INITDB_DATABASE: voicera
     volumes:
       - mongodb_data:/data/db

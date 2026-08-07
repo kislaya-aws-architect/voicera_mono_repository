@@ -7,3 +7,15 @@ ai4bharat_tts_server/compare_marathi_tts_metrics.py
 ai4bharat_tts_server/server_grpc.py
 ai4bharat_tts_server/tts_pb2_grpc.py
 ai4bharat_tts_server/tts_pb2.py
+
+# Secrets / credentials - never commit these (hardening/phase-0-critical-fixes,
+# SEC-17: a previously leaked RSA private key is what prompted this rule;
+# see the PR notes for the required separate git-history purge, which this
+# .gitignore entry alone does not undo for already-committed history).
+*.pem
+*.key
+.env
+.env.local
+.env.*.local
+!*.env.example
+!env.example

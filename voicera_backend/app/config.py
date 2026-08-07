@@ -9,14 +9,33 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
+
+def _require_env(name: str) -> str:
+    """
+    Read a required environment variable and fail fast with a clear error
+    if it is missing, instead of silently falling back to an insecure
+    default (see hardening/phase-0-critical-fixes, SEC-04).
+    """
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable: {name}. "
+            f"Set it in voicera_backend/.env (see env.example) before starting the app."
+        )
+    return value
+
+
 class Settings:
     """Application settings loaded from environment variables."""
     
     # MongoDB Configuration
+    # NOTE: user/password/database intentionally have no insecure defaults -
+    # this app must not be able to silently connect with well-known
+    # admin/admin123-style credentials.
     MONGODB_HOST: str = os.getenv("MONGODB_HOST", "localhost")
     MONGODB_PORT: int = int(os.getenv("MONGODB_PORT", "27017"))
-    MONGODB_USER: str = os.getenv("MONGODB_USER", "admin")
-    MONGODB_PASSWORD: str = os.getenv("MONGODB_PASSWORD", "admin123")
+    MONGODB_USER: str = _require_env("MONGODB_USER")
+    MONGODB_PASSWORD: str = _require_env("MONGODB_PASSWORD")
     MONGODB_DATABASE: str = os.getenv("MONGODB_DATABASE", "voicera")
     MONGODB_AUTH_SOURCE: str = os.getenv("MONGODB_AUTH_SOURCE", "admin")
     
@@ -25,7 +44,9 @@ class Settings:
     PROJECT_NAME: str = "Voicera Backend API"
     VERSION: str = "1.0.0"
     DEBUG: bool = os.getenv("DEBUG", "False").lower() == "true"
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "")  # Should be set in .env for production
+    # Required - see app/auth.py for why an unset/auto-generated SECRET_KEY
+    # is unsafe for anything beyond a single, never-restarted process.
+    SECRET_KEY: str = _require_env("SECRET_KEY")
     
     # Mailtrap Configuration
     MAILTRAP_API_TOKEN: str = os.getenv("MAILTRAP_API_TOKEN", "")

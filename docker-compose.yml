@@ -1,15 +1,27 @@
 version: '3.8'
 
+# SECURITY NOTE (hardening/phase-0-critical-fixes):
+# All credentials below are now REQUIRED from a root .env file - there are no
+# insecure defaults. Copy .env.example to .env and fill in real values before
+# running `docker compose up`. See .env.example for the full list of variables
+# and how to generate strong values for each.
+#
+# MongoDB and MinIO are bound to 127.0.0.1 only (not 0.0.0.0) so they are
+# reachable from the host machine for local development/admin access but are
+# NOT exposed to the network or the public internet by default. Remove the
+# 127.0.0.1 prefix only if you have your own network-level access control
+# (security group / firewall / VPC) in front of this host.
+
 services:
   mongodb:
     image: mongo:latest
     container_name: voicera_mongodb
     restart: unless-stopped
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     environment:
-      MONGO_INITDB_ROOT_USERNAME: admin
-      MONGO_INITDB_ROOT_PASSWORD: admin123
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?Set MONGO_ROOT_USERNAME in .env - see .env.example}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?Set MONGO_ROOT_PASSWORD in .env - see .env.example}
       MONGO_INITDB_DATABASE: voicera
     volumes:
       - mongodb_data:/data/db
@@ -37,6 +49,8 @@ services:
       - ./voicera_backend/.env
     environment:
       - MONGODB_HOST=mongodb
+      - MONGODB_USER=${MONGO_ROOT_USERNAME:?Set MONGO_ROOT_USERNAME in .env - see .env.example}
+      - MONGODB_PASSWORD=${MONGO_ROOT_PASSWORD:?Set MONGO_ROOT_PASSWORD in .env - see .env.example}
     depends_on:
       mongodb:
         condition: service_healthy
@@ -54,11 +68,11 @@ services:
     container_name: voicera_minio
     restart: unless-stopped
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env - see .env.example}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env - see .env.example}
     volumes:
       - minio_data:/data
     networks:
@@ -105,9 +119,10 @@ services:
     environment:
       - VOICERA_BACKEND_URL=http://backend:8000
       - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env - see .env.example}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env - see .env.example}
       - MINIO_SECURE=false
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:?Set INTERNAL_API_KEY in .env - see .env.example}
     networks:
       - voicera_network
     depends_on:

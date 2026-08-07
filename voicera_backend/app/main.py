@@ -1,6 +1,7 @@
 """
 Main FastAPI application.
 """
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
@@ -26,9 +27,24 @@ app = FastAPI(
 )
 
 # CORS middleware
+#
+# SEC-08 (hardening/phase-0-critical-fixes): allow_origins=["*"] combined
+# with allow_credentials=True is invalid per the Fetch spec (browsers reject
+# it) and, where a proxy reflects the Origin header instead of enforcing the
+# literal wildcard, effectively disables CORS. ALLOWED_ORIGINS must be set
+# to a comma-separated list of real origins - there is no wildcard fallback.
+_allowed_origins_raw = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_raw.split(",") if o.strip()]
+if not ALLOWED_ORIGINS:
+    logger.warning(
+        "ALLOWED_ORIGINS is not set - CORS will reject all cross-origin "
+        "browser requests. Set ALLOWED_ORIGINS in voicera_backend/.env "
+        "(e.g. https://app.yourdomain.com) to allow the frontend through."
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
