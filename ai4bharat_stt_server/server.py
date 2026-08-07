@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hmac
 import os
 import queue
 import threading
@@ -7,7 +8,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 import uvicorn
 
@@ -23,6 +24,29 @@ load_dotenv()
 # =========================
 
 app = FastAPI()
+
+# =========================
+# Auth (hardening/phase-0-critical-fixes, SEC-07)
+#
+# This service previously had no authentication or CORS policy at all -
+# open by omission. It now requires an X-API-Key header on the endpoints
+# that trigger GPU inference (/transcribe, /transcribe/bhili). / and
+# /health are left open for orchestration/monitoring probes.
+# =========================
+
+STT_SERVER_API_KEY = os.environ.get("STT_SERVER_API_KEY", "")
+if not STT_SERVER_API_KEY:
+    print(
+        "WARNING: STT_SERVER_API_KEY is not set - /transcribe and "
+        "/transcribe/bhili will reject all requests until it is configured "
+        "in ai4bharat_stt_server/.env."
+    )
+
+
+async def require_api_key(x_api_key: str = Header(None, alias="X-API-Key")) -> bool:
+    if not STT_SERVER_API_KEY or not x_api_key or not hmac.compare_digest(x_api_key, STT_SERVER_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return True
 
 # =========================
 # Request/Response Models
@@ -242,7 +266,7 @@ def hello_world():
     return {"message": "Hello, World!"}
 
 
-@app.post("/transcribe", response_model=TranscribeResponse)
+@app.post("/transcribe", response_model=TranscribeResponse, dependencies=[Depends(require_api_key)])
 async def transcribe(request: TranscribeRequest):
     audio_np = _decode_audio_b64(request.audio_b64)
     response_queue = _enqueue_request(main_request_queue, audio_np, request.language_id)
@@ -250,7 +274,7 @@ async def transcribe(request: TranscribeRequest):
     return TranscribeResponse(text=result)
 
 
-@app.post("/transcribe/bhili", response_model=TranscribeResponse)
+@app.post("/transcribe/bhili", response_model=TranscribeResponse, dependencies=[Depends(require_api_key)])
 async def transcribe_bhili(request: TranscribeRequest):
     if BHILI_ENABLE != "yes":
         raise HTTPException(status_code=503, detail="Bhili model is disabled")

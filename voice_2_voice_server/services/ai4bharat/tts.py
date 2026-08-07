@@ -121,6 +121,10 @@ class IndicParlerRESTTTSService(TTSService):
                             "prompt": text,
                             "description": self._description_for_server(),
                             "language": self._language_id,
+                            # SEC-07 (hardening/phase-0-critical-fixes):
+                            # ai4bharat_tts_server now requires this field on
+                            # the first message.
+                            "api_key": os.getenv("TTS_SERVER_API_KEY", ""),
                         }
                     )
                 )

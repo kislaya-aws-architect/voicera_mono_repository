@@ -318,7 +318,17 @@ class IndicConformerRESTSTTService(STTService):
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
-        self._session = aiohttp.ClientSession()
+        # SEC-07 (hardening/phase-0-critical-fixes): ai4bharat_stt_server now
+        # requires X-API-Key on /transcribe*. Set it as a default header on
+        # the session rather than per-request.
+        stt_api_key = os.getenv("STT_SERVER_API_KEY", "")
+        default_headers = {"X-API-Key": stt_api_key} if stt_api_key else {}
+        if not stt_api_key:
+            logger.warning(
+                "STT_SERVER_API_KEY is not set - requests to ai4bharat_stt_server "
+                "will be rejected once that service requires authentication."
+            )
+        self._session = aiohttp.ClientSession(headers=default_headers)
         self._disabled = False
         self._audio_buffer.clear()
         self._pre_roll_buffer.clear()

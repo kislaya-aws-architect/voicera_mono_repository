@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import os
 import queue
@@ -21,8 +22,16 @@ import uuid
 import numpy as np
 import torch
 import websockets
+from dotenv import load_dotenv
 
 from inference.runner import ParlerTTSModelRunner, TTSRequest
+
+# hardening/phase-0-critical-fixes: this service previously never loaded a
+# .env file at all (unlike every other Python service in the repo), so
+# TTS_SERVER_API_KEY (SEC-07) would only ever be picked up from a value
+# already exported in the process/shell environment. python-dotenv was
+# already a declared dependency (requirements.txt) but unused.
+load_dotenv()
 
 # Hugging Face DAC for Parler-style models is typically 24 kHz mono.
 AUDIO_SAMPLE_RATE = 44100
@@ -102,8 +111,20 @@ async def handle_client(
         msg = json.loads(raw)
         prompt = msg["prompt"]
         description = msg["description"]
+        client_api_key = msg.get("api_key", "")
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         await websocket.send(json.dumps({"type": "error", "message": f"bad request: {e}"}))
+        return
+
+    # SEC-07 (hardening/phase-0-critical-fixes): this service previously had
+    # no authentication at all. The API key travels as a field on the first
+    # JSON message rather than a header, since this is a raw `websockets`
+    # server rather than a framework with header-based auth hooks. Checked
+    # with hmac.compare_digest to avoid a timing side-channel.
+    expected_key = os.environ.get("TTS_SERVER_API_KEY", "")
+    if not expected_key or not hmac.compare_digest(client_api_key, expected_key):
+        await websocket.send(json.dumps({"type": "error", "message": "unauthorized: invalid or missing api_key"}))
+        await websocket.close(code=4401, reason="unauthorized")
         return
 
     out_q: queue.Queue = queue.Queue()
@@ -162,6 +183,11 @@ async def main_async(
             f"TTS WebSocket server ws://{host}:{port} "
             f"(checkpoints={checkpoint_path}, decode_every={decode_every})"
         )
+        if not os.environ.get("TTS_SERVER_API_KEY"):
+            print(
+                "WARNING: TTS_SERVER_API_KEY is not set - all /connect requests "
+                "will be rejected as unauthorized until it is configured."
+            )
         await asyncio.Future()
 
 
